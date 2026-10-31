@@ -95,6 +95,11 @@ class Bridge:
     ) -> None:
         # No config, provider, auth, or workspace overrides are supplied.
         # app-server therefore uses the user's existing Codex configuration.
+        env = os.environ.copy()
+        if not env.get("HOME"):
+            env["HOME"] = env.get("USERPROFILE", "")
+        if not env.get("CODEX_HOME"):
+            env["CODEX_HOME"] = os.path.join(env["HOME"], ".codex")
         proc = await asyncio.create_subprocess_exec(
             self.codex,
             "app-server",
@@ -102,11 +107,10 @@ class Bridge:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
         )
         assert proc.stdin and proc.stdout and proc.stderr
-        server_writer = asyncio.StreamWriter(
-            proc.stdin, {}, proc.stdin, asyncio.get_running_loop()
-        )
+        server_writer = proc.stdin
 
         async def forward_client() -> None:
             await pipe_stream(client_reader, server_writer)
