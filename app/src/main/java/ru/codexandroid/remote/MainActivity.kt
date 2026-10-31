@@ -1,9 +1,13 @@
 package ru.codexandroid.remote
 
 import android.content.Context
+import android.net.Uri
 import android.os.Bundle
+import androidx.core.content.FileProvider
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -15,8 +19,11 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.IconButton
@@ -52,13 +59,23 @@ import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.Closeable
 import java.io.InputStreamReader
+import java.io.IOException
 import java.io.OutputStreamWriter
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.io.File
 import java.util.UUID
 
 data class CodexThread(val id: String, val title: String, val preview: String)
 data class ChatMessage(val id: String, val role: String, val text: String)
+data class PendingAttachment(val uri: Uri, val name: String)
+data class ModelOption(val id: String, val name: String, val efforts: List<String>)
+enum class AccessOption(val label: String, val sandboxType: String?) {
+    INHERIT("Как в сессии", null),
+    READ_ONLY("Только чтение", "readOnly"),
+    WORKSPACE("Запись в проект", "workspaceWrite"),
+    FULL("Полный доступ", "dangerFullAccess"),
+}
 
 data class AppState(
     val host: String = "",
@@ -71,6 +88,12 @@ data class AppState(
     val threads: List<CodexThread> = emptyList(),
     val selected: CodexThread? = null,
     val messages: List<ChatMessage> = emptyList(),
+    val attachments: List<PendingAttachment> = emptyList(),
+    val models: List<ModelOption> = emptyList(),
+    val model: String? = null,
+    val effort: String? = null,
+    val access: AccessOption = AccessOption.INHERIT,
+    val modelWarning: String? = null,
 )
 
 class BridgeClient(host: String, port: Int, token: String) : Closeable {
@@ -78,6 +101,7 @@ class BridgeClient(host: String, port: Int, token: String) : Closeable {
     private val reader: BufferedReader
     private val writer: BufferedWriter
     private var nextId = 1
+    val isOpen: Boolean get() = !socket.isClosed
 
     init {
         socket.connect(InetSocketAddress(host, port), 15_000)
@@ -103,7 +127,11 @@ class BridgeClient(host: String, port: Int, token: String) : Closeable {
         writer.flush()
         val notifications = mutableListOf<JSONObject>()
         while (true) {
-            val message = JSONObject(reader.readLine() ?: error("Bridge closed while waiting for $method"))
+            val message = JSONObject(reader.readLine() ?: throw IOException("Bridge closed while waiting for $method"))
+            if (message.has("method") && message.has("id")) {
+                close()
+                error("Запрос подтверждения пока не поддерживается приложением; соединение закрыто.")
+            }
             if (message.optInt("id", -1) != id) {
                 notifications += message
                 continue
@@ -119,6 +147,30 @@ class BridgeClient(host: String, port: Int, token: String) : Closeable {
             JSONObject().put("archived", false).put("limit", 100).put("useStateDbOnly", true),
         ).result.optJSONArray("data") ?: JSONArray()
         return (0 until data.length()).map { threadFromJson(data.getJSONObject(it)) }
+    }
+
+    fun listModels(): List<ModelOption> {
+        val models = mutableListOf<ModelOption>()
+        var cursor: String? = null
+        val seen = mutableSetOf<String>()
+        do {
+            val params = JSONObject().put("limit", 100)
+            cursor?.let { params.put("cursor", it) }
+            val result = request("model/list", params).result
+            val data = result.optJSONArray("data") ?: JSONArray()
+            for (i in 0 until data.length()) {
+                val item = data.optJSONObject(i) ?: continue
+                val id = item.optString("model").takeIf { it.isNotBlank() && it != "null" } ?: continue
+                val supported = item.optJSONArray("supportedReasoningEfforts") ?: JSONArray()
+                val efforts = (0 until supported.length()).mapNotNull {
+                    supported.optJSONObject(it)?.optString("reasoningEffort")?.takeIf { e -> e.isNotBlank() }
+                }
+                models.add(ModelOption(id, item.optString("displayName", id), efforts))
+            }
+            cursor = if (result.isNull("nextCursor")) null else result.optString("nextCursor").takeIf { it.isNotBlank() }
+            check(cursor == null || seen.add(cursor)) { "Повтор курсора списка моделей" }
+        } while (cursor != null)
+        return models.distinctBy { it.id }
     }
 
     fun readThread(id: String): List<ChatMessage> {
@@ -140,25 +192,38 @@ class BridgeClient(host: String, port: Int, token: String) : Closeable {
         request("thread/resume", JSONObject().put("threadId", id).put("excludeTurns", true))
     }
 
-    fun startTurn(id: String, text: String, onDelta: (String) -> Unit): String {
+    fun startTurn(id: String, text: String, model: String?, effort: String?, access: AccessOption, onDelta: (String) -> Unit): String {
+        val params = JSONObject()
+            .put("threadId", id)
+            .put("input", JSONArray().put(JSONObject().put("type", "text").put("text", text)))
+        model?.let { params.put("model", it) }
+        effort?.let { params.put("effort", it) }
+        access.sandboxType?.let { params.put("sandboxPolicy", JSONObject().put("type", it)) }
         val response = request(
             "turn/start",
-            JSONObject()
-                .put("threadId", id)
-                .put("input", JSONArray().put(JSONObject().put("type", "text").put("text", text))),
+            params,
         )
         val turnId = response.result.optJSONObject("turn")?.optString("id").orEmpty()
         response.notifications.forEach { event ->
+            if (event.has("id") && event.has("method")) {
+                close()
+                error("Codex запросил подтверждение, которое приложение пока не поддерживает. Соединение закрыто.")
+            }
             if (event.optString("method") == "item/agentMessage/delta") {
                 onDelta(event.optJSONObject("params")?.optString("delta").orEmpty())
             }
         }
         while (true) {
-            val event = JSONObject(reader.readLine() ?: error("Bridge closed during turn"))
+            val event = JSONObject(reader.readLine() ?: throw IOException("Bridge closed during turn"))
+            if (event.has("id") && event.has("method")) {
+                close()
+                error("Codex запросил подтверждение, которое приложение пока не поддерживает. Соединение закрыто.")
+            }
             when (event.optString("method")) {
                 "item/agentMessage/delta" -> onDelta(event.optJSONObject("params")?.optString("delta").orEmpty())
                 "turn/completed" -> {
                     val turn = event.optJSONObject("params")?.optJSONObject("turn")
+                    if (turn?.optString("id") != turnId) continue
                     check(turn?.optString("status") == "completed") {
                         turn?.optJSONObject("error")?.toString() ?: "Turn failed"
                     }
@@ -240,10 +305,37 @@ class CodexViewModel(private val context: Context) : ViewModel() {
             host = preferences.getString("host", "100.114.88.98").orEmpty(),
             port = preferences.getString("port", "8765").orEmpty(),
             token = preferences.getString("token", "").orEmpty(),
+            threads = loadCachedThreads(),
+            status = "Нет подключения. Показаны сохранённые сессии.",
         ),
     )
     val state: StateFlow<AppState> = _state.asStateFlow()
     private var client: BridgeClient? = null
+
+    private fun loadCachedThreads(): List<CodexThread> = try {
+        val data = JSONArray(preferences.getString("threads", "[]"))
+        (0 until data.length()).map { threadFromJson(data.getJSONObject(it)) }
+    } catch (_: Exception) { emptyList() }
+
+    private fun saveThreads(threads: List<CodexThread>) {
+        val data = JSONArray()
+        threads.forEach { data.put(JSONObject().put("id", it.id).put("name", it.title).put("preview", it.preview)) }
+        preferences.edit().putString("threads", data.toString()).apply()
+    }
+
+    private fun saveMessages(threadId: String, messages: List<ChatMessage>) {
+        val data = JSONArray()
+        messages.forEach { data.put(JSONObject().put("id", it.id).put("role", it.role).put("text", it.text)) }
+        preferences.edit().putString("history:$threadId", data.toString()).apply()
+    }
+
+    private fun loadMessages(threadId: String): List<ChatMessage> = try {
+        val data = JSONArray(preferences.getString("history:$threadId", "[]"))
+        (0 until data.length()).map {
+            val item = data.getJSONObject(it)
+            ChatMessage(item.getString("id"), item.getString("role"), item.getString("text"))
+        }
+    } catch (_: Exception) { emptyList() }
 
     fun updateSettings(host: String, port: String, token: String) {
         _state.value = _state.value.copy(host = host, port = port, token = token)
@@ -258,7 +350,16 @@ class CodexViewModel(private val context: Context) : ViewModel() {
                 client?.close()
                 client = BridgeClient(current.host.trim(), current.port.toInt(), current.token.trim())
                 val threads = client!!.listThreads()
-                _state.value = _state.value.copy(connected = true, loading = false, threads = threads, status = "Подключено")
+                saveThreads(threads)
+                var warning: String? = null
+                val models = try {
+                    client!!.listModels()
+                } catch (error: Exception) {
+                    if (client?.isOpen != true || error is IOException) throw error
+                    warning = "Не удалось загрузить модели: ${error.message}. Доступны настройки сессии."
+                    emptyList()
+                }
+                _state.value = _state.value.copy(connected = true, loading = false, threads = threads, models = models, modelWarning = warning, status = "Подключено")
             } catch (error: Exception) {
                 client?.close()
                 client = null
@@ -268,23 +369,61 @@ class CodexViewModel(private val context: Context) : ViewModel() {
     }
 
     fun openThread(thread: CodexThread) {
+        if (!_state.value.connected) {
+            _state.value = _state.value.copy(
+                selected = thread,
+                messages = loadMessages(thread.id),
+                status = "Нет подключения. Показана сохранённая история.",
+            )
+            return
+        }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val messages = client?.readThread(thread.id).orEmpty()
+                val messages = (client ?: error("Нет подключения к bridge")).readThread(thread.id)
+                saveMessages(thread.id, messages)
                 _state.value = _state.value.copy(selected = thread, messages = messages, status = "Открыта сессия")
             } catch (error: Exception) {
-                _state.value = _state.value.copy(status = "Не удалось открыть: ${error.message}")
+                if (error is IOException) {
+                    client?.close()
+                    client = null
+                    _state.value = _state.value.copy(connected = false)
+                }
+                _state.value = _state.value.copy(
+                    selected = thread,
+                    messages = loadMessages(thread.id),
+                    status = "Не удалось обновить историю: ${error.message}. Показан кэш.",
+                )
             }
         }
     }
 
     fun closeThread() {
-        _state.value = _state.value.copy(selected = null, messages = emptyList())
+        _state.value = _state.value.copy(selected = null, messages = emptyList(), attachments = emptyList())
+    }
+
+    fun addAttachment(attachment: PendingAttachment) {
+        _state.value = _state.value.copy(attachments = _state.value.attachments + attachment)
+    }
+
+    fun removeAttachment(attachment: PendingAttachment) {
+        _state.value = _state.value.copy(attachments = _state.value.attachments - attachment)
+    }
+
+    fun selectModel(model: String?) {
+        _state.value = _state.value.copy(model = model, effort = null)
+    }
+
+    fun selectEffort(effort: String?) {
+        _state.value = _state.value.copy(effort = effort)
+    }
+
+    fun selectAccess(access: AccessOption) {
+        _state.value = _state.value.copy(access = access)
     }
 
     fun send(text: String) {
         val thread = _state.value.selected ?: return
-        if (text.isBlank() || _state.value.sending) return
+        if (text.isBlank() || _state.value.sending || !_state.value.connected || _state.value.attachments.isNotEmpty()) return
         viewModelScope.launch(Dispatchers.IO) {
             val user = ChatMessage(UUID.randomUUID().toString(), "user", text)
             val assistantId = UUID.randomUUID().toString()
@@ -296,16 +435,23 @@ class CodexViewModel(private val context: Context) : ViewModel() {
             try {
                 val currentClient = client ?: error("Нет подключения к bridge")
                 currentClient.resumeThread(thread.id)
-                currentClient.startTurn(thread.id, text) { delta ->
+                val options = _state.value
+                currentClient.startTurn(thread.id, text, options.model, options.effort, options.access) { delta ->
                     _state.value = _state.value.copy(
                         messages = _state.value.messages.map { message ->
                             if (message.id == assistantId) message.copy(text = message.text + delta) else message
                         },
                     )
                 }
+                saveMessages(thread.id, _state.value.messages)
                 _state.value = _state.value.copy(sending = false, status = "Готово")
             } catch (error: Exception) {
-                _state.value = _state.value.copy(sending = false, status = "Ошибка ответа: ${error.message}")
+                if (error is IOException || error.message?.contains("соединение закрыто", ignoreCase = true) == true) {
+                    client?.close()
+                    client = null
+                    _state.value = _state.value.copy(connected = false)
+                }
+                _state.value = _state.value.copy(sending = false, status = "Ошибка ответа: ${error.message}. Проверьте историю перед повтором.")
             }
         }
     }
@@ -341,6 +487,24 @@ private fun CodexApp() {
     var port by remember(state.port) { mutableStateOf(state.port) }
     var token by remember(state.token) { mutableStateOf(state.token) }
     var draft by remember { mutableStateOf("") }
+    var cameraUri by remember { mutableStateOf<Uri?>(null) }
+    val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
+        val uri = cameraUri
+        if (success && uri != null) viewModel.addAttachment(PendingAttachment(uri, "Фото с камеры"))
+        cameraUri = null
+    }
+    val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) {
+            val file = File(context.cacheDir, "camera").apply { mkdirs() }
+            val photo = File.createTempFile("codex-", ".jpg", file)
+            val target = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", photo)
+            cameraUri = target
+            camera.launch(target)
+        }
+    }
+    val pickFile = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        uri?.let { viewModel.addAttachment(PendingAttachment(it, it.lastPathSegment ?: "Файл")) }
+    }
 
     MaterialTheme {
         Surface(Modifier.fillMaxSize()) {
@@ -365,7 +529,20 @@ private fun CodexApp() {
                     messages = state.messages,
                     draft = draft,
                     sending = state.sending,
+                    connected = state.connected,
                     status = state.status,
+                    models = state.models,
+                    model = state.model,
+                    effort = state.effort,
+                    access = state.access,
+                    attachments = state.attachments,
+                    modelWarning = state.modelWarning,
+                    onModel = viewModel::selectModel,
+                    onEffort = viewModel::selectEffort,
+                    onAccess = viewModel::selectAccess,
+                    onPickFile = { pickFile.launch("*/*") },
+                    onCamera = { cameraPermission.launch(android.Manifest.permission.CAMERA) },
+                    onRemoveAttachment = viewModel::removeAttachment,
                     onDraftChange = { draft = it },
                     onBack = viewModel::closeThread,
                     onSend = { viewModel.send(draft); draft = "" },
@@ -399,7 +576,7 @@ private fun ConnectionScreen(
             Button(onClick = onConnect, enabled = !state.loading, modifier = Modifier.fillMaxWidth()) {
                 if (state.loading) CircularProgressIndicator() else Text("Подключиться и загрузить сессии")
             }
-            if (state.connected) {
+            if (state.connected || state.threads.isNotEmpty()) {
                 Text("История Codex", style = MaterialTheme.typography.titleLarge)
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     items(state.threads, key = { it.id }) { thread ->
@@ -424,12 +601,35 @@ private fun ChatScreen(
     messages: List<ChatMessage>,
     draft: String,
     sending: Boolean,
+    connected: Boolean,
     status: String,
+    models: List<ModelOption>,
+    model: String?,
+    effort: String?,
+    access: AccessOption,
+    attachments: List<PendingAttachment>,
+    modelWarning: String?,
+    onModel: (String?) -> Unit,
+    onEffort: (String?) -> Unit,
+    onAccess: (AccessOption) -> Unit,
+    onPickFile: () -> Unit,
+    onCamera: () -> Unit,
+    onRemoveAttachment: (PendingAttachment) -> Unit,
     onDraftChange: (String) -> Unit,
     onBack: () -> Unit,
     onSend: () -> Unit,
 ) {
     val listState = rememberLazyListState()
+    var confirmFullAccess by remember { mutableStateOf(false) }
+    if (confirmFullAccess) {
+        AlertDialog(
+            onDismissRequest = { confirmFullAccess = false },
+            title = { Text("Полный доступ к ПК") },
+            text = { Text("Codex сможет выполнять команды и изменять файлы вне проекта. Подтверждения команд в приложении пока не поддерживаются. Продолжить?") },
+            confirmButton = { TextButton(onClick = { onAccess(AccessOption.FULL); confirmFullAccess = false }) { Text("Разрешить") } },
+            dismissButton = { TextButton(onClick = { confirmFullAccess = false }) { Text("Отмена") } },
+        )
+    }
     LaunchedEffect(messages.size, messages.lastOrNull()?.text) {
         if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
     }
@@ -443,9 +643,47 @@ private fun ChatScreen(
         bottomBar = {
             Column(Modifier.padding(12.dp)) {
                 Text(status, style = MaterialTheme.typography.bodySmall)
+                modelWarning?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                Row {
+                    ChoiceMenu(
+                        label = "Модель: ${models.firstOrNull { it.id == model }?.name ?: "сессия"}",
+                        options = listOf("Как в сессии" to null) + models.map { it.name to it.id },
+                        enabled = !sending,
+                        onSelect = onModel,
+                    )
+                    val efforts = models.firstOrNull { it.id == model }?.efforts.orEmpty()
+                    ChoiceMenu(
+                        label = "Effort: ${effort ?: "сессия"}",
+                        options = listOf("Как в сессии" to null) + efforts.map { it to it },
+                        enabled = !sending && model != null,
+                        onSelect = onEffort,
+                    )
+                }
+                ChoiceMenu(
+                    label = "Доступ: ${access.label}",
+                    options = AccessOption.entries.map { it.label to it },
+                    enabled = !sending,
+                    onSelect = { if (it == AccessOption.FULL) confirmFullAccess = true else onAccess(it) },
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = onPickFile, enabled = !sending && connected) { Text("Прикрепить файл") }
+                    TextButton(onClick = onCamera, enabled = !sending && connected) { Text("Камера") }
+                }
+                attachments.forEach { attachment ->
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("📎 ${attachment.name}", style = MaterialTheme.typography.bodySmall)
+                        TextButton(onClick = { onRemoveAttachment(attachment) }) { Text("Убрать") }
+                    }
+                }
+                if (attachments.isNotEmpty()) {
+                    Text(
+                        "Файлы выбраны локально. Передача вложений в Codex будет подключена через отдельный upload-протокол.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(draft, onDraftChange, label = { Text("Сообщение") }, modifier = Modifier.weight(1f))
-                    Button(onClick = onSend, enabled = draft.isNotBlank() && !sending) { Text("Отправить") }
+                    Button(onClick = onSend, enabled = draft.isNotBlank() && !sending && connected && attachments.isEmpty()) { Text("Отправить") }
                 }
             }
         },
@@ -463,6 +701,24 @@ private fun ChatScreen(
                         Text(message.text.ifBlank { "…" })
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun <T> ChoiceMenu(
+    label: String,
+    options: List<Pair<String, T>>,
+    enabled: Boolean,
+    onSelect: (T) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    androidx.compose.foundation.layout.Box {
+        TextButton(onClick = { expanded = true }, enabled = enabled) { Text(label, maxLines = 1) }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            options.forEach { (title, value) ->
+                DropdownMenuItem(text = { Text(title) }, onClick = { expanded = false; onSelect(value) })
             }
         }
     }

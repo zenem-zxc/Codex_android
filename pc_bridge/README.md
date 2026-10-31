@@ -36,10 +36,11 @@ After building:
 ```
 
 The bridge starts `codex app-server --stdio` only after an authenticated
-client connects. It forwards every JSONL message unchanged in both directions:
-requests, responses, notifications, and server approval requests. It does not
-change `config.toml`, `auth.json`, provider selection, workspace, or session
-history.
+client connects. It forwards App Server JSONL messages in both directions:
+requests, responses, notifications, and server approval requests. The
+`bridge/upload` control method is handled by the bridge itself. The bridge
+does not change `config.toml`, `auth.json`, or provider selection, but an
+authenticated client can request operations that modify files or history.
 
 ## Install at logon
 
@@ -63,3 +64,27 @@ The client protocol is:
 
 One client is allowed at a time in this MVP, preventing two phones from
 driving the same Codex session concurrently.
+
+## Upload control method
+
+The bridge accepts an additional authenticated control request:
+
+```json
+{
+  "id": 10,
+  "method": "bridge/upload",
+  "params": {
+    "fileName": "photo.jpg",
+    "mimeType": "image/jpeg",
+    "dataBase64": "..."
+  }
+}
+```
+
+Files are written to `%USERPROFILE%\.codex\bridge-uploads`, with generated
+names and a 10 MiB limit. The response includes the absolute host path and
+SHA-256. This method is not forwarded to Codex. The Android client may use the
+returned path as a `localImage` input; document input still needs a separate
+protocol integration. Uploads are not automatically cleaned up. Treat them as
+sensitive files; token authentication grants access to the full App Server
+protocol, not just uploads. The TCP transport does not provide TLS.

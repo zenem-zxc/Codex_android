@@ -1,9 +1,8 @@
 """Transparent Codex App Server bridge for Windows.
 
-The bridge deliberately does not implement an RPC allowlist. Every
-newline-delimited JSON-RPC request, response, and notification is forwarded
-unchanged between one authenticated client and a local `codex app-server`.
-That preserves the complete App Server surface, including approval requests.
+The bridge deliberately does not implement an RPC allowlist. Apart from the
+bridge/upload control method, newline-delimited JSON-RPC requests, responses,
+and notifications are forwarded between an authenticated client and Codex.
 
 This first version uses a bearer token over a TCP connection. Put the port
 behind a private VPN (for example Tailscale/ZeroTier) before exposing it
@@ -14,17 +13,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
+import hashlib
 import json
 import os
 import secrets
-import signal
 import shutil
 import subprocess
 import sys
+import uuid
+import re
 from pathlib import Path
 
 
 MAX_LINE = 16 * 1024 * 1024
+# Base64 expands by 4/3; keep the entire JSON request below MAX_LINE.
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 
 def resolve_codex(value: str) -> str:
@@ -87,10 +92,11 @@ async def pipe_stream(
 
 
 class Bridge:
-    def __init__(self, codex: str, token: str) -> None:
+    def __init__(self, codex: str, token: str, upload_dir: Path | None = None) -> None:
         self.codex = codex
         self.token = token
         self.active: asyncio.Task[None] | None = None
+        self.upload_dir = upload_dir or Path.home() / ".codex" / "bridge-uploads"
 
     async def handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -142,7 +148,24 @@ class Bridge:
         server_writer = proc.stdin
 
         async def forward_client() -> None:
-            await pipe_stream(client_reader, server_writer)
+            while True:
+                line = await client_reader.readline()
+                if not line:
+                    break
+                if len(line) > MAX_LINE:
+                    raise ValueError("JSON-RPC message is too large")
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    server_writer.write(line)
+                    await server_writer.drain()
+                    continue
+                if isinstance(message, dict) and message.get("method") == "bridge/upload":
+                    response = await self.handle_upload(message)
+                    await write_line(client_writer, json.dumps(response, ensure_ascii=False))
+                    continue
+                server_writer.write(line)
+                await server_writer.drain()
             server_writer.close()
             await server_writer.wait_closed()
 
@@ -164,6 +187,56 @@ class Bridge:
         if proc.returncode is None:
             proc.terminate()
         await proc.wait()
+
+    async def handle_upload(self, message: dict) -> dict:
+        request_id = message.get("id")
+        try:
+            if not isinstance(request_id, (int, str)) or isinstance(request_id, bool):
+                raise ValueError("upload requires a request id")
+            params = message.get("params") or {}
+            if not isinstance(params, dict):
+                raise ValueError("params must be an object")
+            encoded = params["dataBase64"]
+            if not isinstance(encoded, str):
+                raise ValueError("dataBase64 must be a string")
+            if len(encoded) > ((MAX_UPLOAD_BYTES + 2) // 3) * 4:
+                raise ValueError(f"upload exceeds {MAX_UPLOAD_BYTES} bytes")
+            raw = base64.b64decode(encoded, validate=True)
+            if not raw:
+                raise ValueError("empty upload")
+            if len(raw) > MAX_UPLOAD_BYTES:
+                raise ValueError(f"upload exceeds {MAX_UPLOAD_BYTES} bytes")
+            original = str(params.get("fileName", "attachment.bin")).replace("\\", "/").rsplit("/", 1)[-1]
+            if not original or len(original) > 255 or any(ord(c) < 32 for c in original):
+                raise ValueError("invalid fileName")
+            suffix = Path(original).suffix.lower()
+            if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
+                suffix = ".bin"
+            safe_name = f"{uuid.uuid4().hex}{suffix}"
+            self.upload_dir.mkdir(parents=True, exist_ok=True)
+            target = self.upload_dir / safe_name
+            with target.open("xb") as output:
+                try:
+                    output.write(raw)
+                except Exception:
+                    output.close()
+                    target.unlink(missing_ok=True)
+                    raise
+            return {
+                "id": request_id,
+                "result": {
+                    "path": str(target.resolve()),
+                    "fileName": original,
+                    "mimeType": str(params.get("mimeType", "application/octet-stream")),
+                    "size": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                },
+            }
+        except (KeyError, ValueError, binascii.Error, OSError) as error:
+            return {
+                "id": request_id,
+                "error": {"code": -32602, "message": str(error)},
+            }
 
 
 async def serve(host: str, port: int, codex: str, token_file: Path) -> None:
