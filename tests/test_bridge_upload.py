@@ -62,13 +62,24 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(Path(response["result"]["path"]).parent, self.directory)
         self.assertEqual(response["result"]["fileName"], "test.pdf")
 
+    async def test_mime_type_preserves_presentation_extension(self):
+        response = await self.bridge.handle_upload({
+            "id": 8,
+            "params": {
+                "fileName": "content",
+                "mimeType": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                "dataBase64": base64.b64encode(b"pptx").decode(),
+            },
+        })
+        self.assertEqual(Path(response["result"]["path"]).suffix, ".pptx")
+
     async def test_streamed_upload_and_size_validation(self):
         uploads = {}
         def send(method, params):
             return self.bridge.handle_stream_upload({"id": 1, "method": method, "params": params}, uploads)
         for size in [0, MAX_STREAM_UPLOAD_BYTES + 1, True]:
-            self.assertIn("error", send("bridge/upload/start", {"fileName": "x.txt", "size": size}))
-        started = send("bridge/upload/start", {"fileName": "../test.txt", "size": 6})
+            self.assertIn("error", send("bridge/upload/start", {"fileName": "x.txt", "size": size, "threadId": "test"}))
+        started = send("bridge/upload/start", {"fileName": "../test.txt", "size": 6, "threadId": "test"})
         upload_id = started["result"]["uploadId"]
         self.assertIn("error", send("bridge/upload/finish", {"uploadId": upload_id}))
         for chunk in [b"abc", b"def"]:
@@ -82,11 +93,25 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stream_cancel_removes_partial_file(self):
         uploads = {}
-        started = self.bridge.handle_stream_upload({"id": 1, "method": "bridge/upload/start", "params": {"fileName": "x", "size": 5}}, uploads)
+        started = self.bridge.handle_stream_upload({"id": 1, "method": "bridge/upload/start", "params": {"fileName": "x", "size": 5, "threadId": "test"}}, uploads)
         upload_id = started["result"]["uploadId"]
         result = self.bridge.handle_stream_upload({"id": 2, "method": "bridge/upload/cancel", "params": {"uploadId": upload_id}}, uploads)
         self.assertTrue(result["result"]["cancelled"])
-        self.assertEqual(list(self.directory.iterdir()), [])
+        self.assertEqual(list(self.directory.rglob("*.part")), [])
+
+    async def test_scopes_by_thread_and_model_and_rejects_traversal(self):
+        uploads = {}
+        def start(thread, model):
+            return self.bridge.handle_stream_upload({"id": 1, "method": "bridge/upload/start", "params": {
+                "threadId": thread, "model": model, "fileName": "Презентация.pptx", "size": 1}}, uploads)
+        self.assertIn("error", start("..", "model-a"))
+        self.assertIn("error", start("thread-a", {"invalid": True}))
+        first = start("thread-a", "model-a")["result"]["uploadId"]
+        second = start("thread-a", "model-b")["result"]["uploadId"]
+        third = start("thread-b", "model-a")["result"]["uploadId"]
+        self.assertEqual(len({uploads[x]["path"].parent for x in (first, second, third)}), 3)
+        for upload_id in list(uploads):
+            self.bridge.handle_stream_upload({"id": 2, "method": "bridge/upload/cancel", "params": {"uploadId": upload_id}}, uploads)
 
 
 if __name__ == "__main__":

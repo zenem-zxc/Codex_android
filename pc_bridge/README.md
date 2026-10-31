@@ -81,8 +81,8 @@ The bridge accepts an additional authenticated control request:
 }
 ```
 
-Files are written to `%USERPROFILE%\.codex\bridge-uploads`, with generated
-names and a 10 MiB limit. The response includes the absolute host path and
+Files are written to `%USERPROFILE%\.codex\bridge-uploads\<thread-id>\<model-hash>`,
+with generated names and a 10 MiB limit. The response includes the absolute host path and
 SHA-256. This method is not forwarded to Codex. The Android client may use the
 returned path as a `localImage` input; document input still needs a separate
 protocol integration. Uploads are not automatically cleaned up. Treat them as
@@ -96,3 +96,6 @@ then `bridge/upload/chunk` (`uploadId`, `dataBase64`) with chunks of at most
 bridge also removes incomplete uploads on disconnect. Finished uploads remain
 on disk until manually removed. An image path can be sent as `localImage`;
 other file paths are provided as text and their use depends on Codex access.
+Streamed uploads must include `threadId`; the optional selected model is
+hashed into the second directory level, preventing a shared attachment
+directory across sessions/models.

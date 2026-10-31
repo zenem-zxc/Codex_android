@@ -24,6 +24,7 @@ import subprocess
 import sys
 import uuid
 import re
+import unicodedata
 from pathlib import Path
 
 
@@ -32,6 +33,21 @@ MAX_LINE = 16 * 1024 * 1024
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_STREAM_UPLOAD_BYTES = 1024 * 1024 * 1024
 MAX_CHUNK_BYTES = 256 * 1024
+MIME_SUFFIXES = {
+    "application/pdf": ".pdf",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "application/vnd.ms-powerpoint": ".ppt",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.ms-excel": ".xls",
+    "text/plain": ".txt",
+    "text/csv": ".csv",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "application/zip": ".zip",
+}
 
 
 def resolve_codex(value: str) -> str:
@@ -99,6 +115,17 @@ class Bridge:
         self.token = token
         self.active: asyncio.Task[None] | None = None
         self.upload_dir = upload_dir or Path.home() / ".codex" / "bridge-uploads"
+
+    def scoped_upload_dir(self, thread_id: str, model: str | None) -> Path:
+        """Keep attachments isolated by Codex thread and selected model."""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", thread_id):
+            raise ValueError("invalid threadId")
+        if model is not None and (not isinstance(model, str) or len(model) > 512):
+            raise ValueError("invalid model")
+        model_key = model or "session-default"
+        model_key = unicodedata.normalize("NFKC", model_key)
+        digest = hashlib.sha256(model_key.encode("utf-8")).hexdigest()[:24]
+        return self.upload_dir / thread_id / digest
 
     async def handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -198,18 +225,36 @@ class Bridge:
             while line := await proc.stderr.readline():
                 print("[codex] " + line.decode("utf-8", "replace").rstrip(), file=sys.stderr)
 
-        tasks = [
-            asyncio.create_task(forward_client()),
-            asyncio.create_task(forward_server()),
-            asyncio.create_task(log_stderr()),
-        ]
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        if proc.returncode is None:
-            proc.terminate()
-        await proc.wait()
+        client_task = asyncio.create_task(forward_client(), name="client-to-codex")
+        server_task = asyncio.create_task(forward_server(), name="codex-to-client")
+        stderr_task = asyncio.create_task(log_stderr(), name="codex-stderr")
+        tasks = (client_task, server_task, stderr_task)
+        try:
+            # EOF on stderr alone does not mean the app-server session ended.
+            done, _ = await asyncio.wait(
+                (client_task, server_task), return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                if not task.cancelled():
+                    error = task.exception()
+                    if error is not None:
+                        print(
+                            f"bridge {task.get_name()} failed: "
+                            f"{type(error).__name__}: {error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+            await proc.wait()
 
     def handle_stream_upload(self, message: dict, uploads: dict) -> dict:
         request_id = message.get("id")
@@ -228,16 +273,23 @@ class Bridge:
                 if not isinstance(name, str) or len(name) > 255 or not name or any(ord(c) < 32 for c in name):
                     raise ValueError("invalid fileName")
                 name = name.replace("\\", "/").rsplit("/", 1)[-1]
+                thread_id = params.get("threadId")
+                if not isinstance(thread_id, str) or not thread_id:
+                    raise ValueError("threadId is required for streamed uploads")
+                upload_root = self.scoped_upload_dir(thread_id, params.get("model"))
+                mime_type = str(params.get("mimeType", "")).lower().split(";", 1)[0]
                 suffix = Path(name).suffix.lower()
                 if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
-                    suffix = ".bin"
+                    suffix = MIME_SUFFIXES.get(mime_type, ".bin")
                 if len(uploads) >= 4:
                     raise ValueError("too many active uploads")
-                self.upload_dir.mkdir(parents=True, exist_ok=True)
+                upload_root.mkdir(parents=True, exist_ok=True)
                 upload_id = uuid.uuid4().hex
-                path = self.upload_dir / (upload_id + suffix + ".part")
+                path = upload_root / (upload_id + suffix + ".part")
                 uploads[upload_id] = {"file": path.open("xb"), "path": path, "name": name,
-                                      "size": size, "received": 0, "hash": hashlib.sha256(), "suffix": suffix}
+                                      "size": size, "received": 0, "hash": hashlib.sha256(), "suffix": suffix,
+                                      "mimeType": mime_type or "application/octet-stream",
+                                      "threadId": thread_id}
                 result = {"uploadId": upload_id, "chunkSize": MAX_CHUNK_BYTES}
             else:
                 upload_id = params.get("uploadId")
@@ -259,11 +311,13 @@ class Bridge:
                     if upload["received"] != upload["size"]:
                         raise ValueError("upload incomplete")
                     upload["file"].close()
-                    target = self.upload_dir / (upload_id + upload["suffix"])
+                    target = upload["path"].with_suffix("")
+                    target = target.with_suffix(upload["suffix"])
                     upload["path"].rename(target)
                     del uploads[upload_id]
                     result = {"path": str(target.resolve()), "fileName": upload["name"],
-                              "size": upload["size"], "sha256": upload["hash"].hexdigest()}
+                              "size": upload["size"], "sha256": upload["hash"].hexdigest(),
+                              "mimeType": upload.get("mimeType", "application/octet-stream")}
                 elif method == "bridge/upload/cancel":
                     upload["file"].close()
                     upload["path"].unlink(missing_ok=True)
@@ -296,9 +350,10 @@ class Bridge:
             original = str(params.get("fileName", "attachment.bin")).replace("\\", "/").rsplit("/", 1)[-1]
             if not original or len(original) > 255 or any(ord(c) < 32 for c in original):
                 raise ValueError("invalid fileName")
+            mime_type = str(params.get("mimeType", "")).lower().split(";", 1)[0]
             suffix = Path(original).suffix.lower()
             if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
-                suffix = ".bin"
+                suffix = MIME_SUFFIXES.get(mime_type, ".bin")
             safe_name = f"{uuid.uuid4().hex}{suffix}"
             self.upload_dir.mkdir(parents=True, exist_ok=True)
             target = self.upload_dir / safe_name
@@ -314,7 +369,7 @@ class Bridge:
                 "result": {
                     "path": str(target.resolve()),
                     "fileName": original,
-                    "mimeType": str(params.get("mimeType", "application/octet-stream")),
+                    "mimeType": mime_type or "application/octet-stream",
                     "size": len(raw),
                     "sha256": hashlib.sha256(raw).hexdigest(),
                 },

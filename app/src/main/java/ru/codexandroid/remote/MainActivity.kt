@@ -70,7 +70,7 @@ import java.util.UUID
 
 data class CodexThread(val id: String, val title: String, val preview: String)
 data class ChatMessage(val id: String, val role: String, val text: String)
-data class PendingAttachment(val uri: Uri, val name: String)
+data class PendingAttachment(val uri: Uri, val name: String, val mimeType: String? = null)
 data class ModelOption(val id: String, val name: String, val efforts: List<String>)
 enum class AccessOption(val label: String, val sandboxType: String?) {
     INHERIT("Как в сессии", null),
@@ -104,6 +104,7 @@ class BridgeClient(host: String, port: Int, token: String) : Closeable {
     private val reader: BufferedReader
     private val writer: BufferedWriter
     private var nextId = 1
+    private val resumedThreads = mutableSetOf<String>()
     val isOpen: Boolean get() = !socket.isClosed
 
     init {
@@ -192,12 +193,30 @@ class BridgeClient(host: String, port: Int, token: String) : Closeable {
     }
 
     fun resumeThread(id: String) {
-        request("thread/resume", JSONObject().put("threadId", id).put("excludeTurns", true))
+        if (resumedThreads.add(id)) {
+            try {
+                request("thread/resume", JSONObject().put("threadId", id).put("excludeTurns", true))
+            } catch (error: Exception) {
+                resumedThreads.remove(id)
+                throw error
+            }
+        }
     }
 
-    fun upload(name: String, size: Long, stream: java.io.InputStream, progress: (Long, Long) -> Unit): String {
+    fun upload(
+        threadId: String,
+        model: String?,
+        name: String,
+        mimeType: String?,
+        size: Long,
+        stream: java.io.InputStream,
+        progress: (Long, Long) -> Unit,
+    ): String {
         require(size in 1..(1024L * 1024 * 1024)) { "Размер файла должен быть от 1 байта до 1 ГиБ" }
-        val start = request("bridge/upload/start", JSONObject().put("fileName", name).put("size", size)).result
+        val params = JSONObject().put("threadId", threadId).put("fileName", name).put("size", size)
+        model?.let { params.put("model", it) }
+        mimeType?.let { params.put("mimeType", it) }
+        val start = request("bridge/upload/start", params).result
         val uploadId = start.getString("uploadId")
         try {
             val buffer = ByteArray(start.optInt("chunkSize", 262144).coerceIn(1, 262144))
@@ -220,11 +239,21 @@ class BridgeClient(host: String, port: Int, token: String) : Closeable {
         }
     }
 
-    fun startTurn(id: String, text: String, images: List<String>, documents: List<String>, model: String?, effort: String?, access: AccessOption, onDelta: (String) -> Unit): String {
+    fun startTurn(
+        id: String,
+        text: String,
+        images: List<Pair<String, String>>,
+        documents: List<Pair<String, String>>,
+        model: String?,
+        effort: String?,
+        access: AccessOption,
+        onDelta: (String) -> Unit,
+    ): String {
         val input = JSONArray()
-        val message = if (documents.isEmpty()) text else text + "\n\nФайлы на ПК:\n" + documents.joinToString("\n")
+        val message = if (documents.isEmpty()) text else text + "\n\nПрикреплённые файлы:\n" +
+            documents.joinToString("\n") { (name, path) -> "- $name\n  Путь: $path" }
         input.put(JSONObject().put("type", "text").put("text", message))
-        images.forEach { input.put(JSONObject().put("type", "localImage").put("path", it)) }
+        images.forEach { (_, path) -> input.put(JSONObject().put("type", "localImage").put("path", path)) }
         val params = JSONObject()
             .put("threadId", id)
             .put("input", input)
@@ -401,11 +430,14 @@ class CodexViewModel(private val context: Context) : ViewModel() {
     }
 
     fun openThread(thread: CodexThread) {
+        if (_state.value.loading || _state.value.sending) return
+        _state.value = _state.value.copy(loading = true)
         if (!_state.value.connected) {
             _state.value = _state.value.copy(
                 selected = thread,
                 messages = loadMessages(thread.id),
                 status = "Нет подключения. Показана сохранённая история.",
+                loading = false,
             )
             return
         }
@@ -413,7 +445,7 @@ class CodexViewModel(private val context: Context) : ViewModel() {
             try {
                 val messages = (client ?: error("Нет подключения к bridge")).readThread(thread.id)
                 saveMessages(thread.id, messages)
-                _state.value = _state.value.copy(selected = thread, messages = messages, status = "Открыта сессия")
+                _state.value = _state.value.copy(selected = thread, messages = messages, loading = false, status = "Открыта сессия")
             } catch (error: Exception) {
                 if (error is IOException) {
                     client?.close()
@@ -423,6 +455,7 @@ class CodexViewModel(private val context: Context) : ViewModel() {
                 _state.value = _state.value.copy(
                     selected = thread,
                     messages = loadMessages(thread.id),
+                    loading = false,
                     status = "Не удалось обновить историю: ${error.message}. Показан кэш.",
                 )
             }
@@ -430,6 +463,7 @@ class CodexViewModel(private val context: Context) : ViewModel() {
     }
 
     fun closeThread() {
+        if (_state.value.sending) return
         _state.value = _state.value.copy(selected = null, messages = emptyList(), attachments = emptyList())
     }
 
@@ -455,22 +489,25 @@ class CodexViewModel(private val context: Context) : ViewModel() {
 
     fun send(text: String) {
         val thread = _state.value.selected ?: return
-        if ((text.isBlank() && _state.value.attachments.isEmpty()) || _state.value.sending || !_state.value.connected) return
+        if ((text.isBlank() && _state.value.attachments.isEmpty()) || _state.value.sending || _state.value.loading || !_state.value.connected) return
+        _state.value = _state.value.copy(sending = true)
         viewModelScope.launch(Dispatchers.IO) {
             val user = ChatMessage(UUID.randomUUID().toString(), "user", text)
             val assistantId = UUID.randomUUID().toString()
+            var stage = "открытие сессии"
+            var turnStarted = false
             _state.value = _state.value.copy(
                 sending = true,
-                messages = _state.value.messages + user + ChatMessage(assistantId, "assistant", ""),
-                status = "Модель отвечает…",
+                status = "Открытие сессии…",
             )
             try {
                 val currentClient = client ?: error("Нет подключения к bridge")
                 currentClient.resumeThread(thread.id)
                 val options = _state.value
-                val images = mutableListOf<String>()
-                val documents = mutableListOf<String>()
+                val images = mutableListOf<Pair<String, String>>()
+                val documents = mutableListOf<Pair<String, String>>()
                 for (attachment in options.attachments) {
+                    stage = "загрузка файла ${attachment.name}"
                     val resolver = context.contentResolver
                     val size = resolver.query(attachment.uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use {
                         if (it.moveToFirst() && !it.isNull(0)) it.getLong(0) else -1L
@@ -478,17 +515,24 @@ class CodexViewModel(private val context: Context) : ViewModel() {
                     require(size > 0) { "Не удалось узнать размер ${attachment.name}" }
                     _state.value = _state.value.copy(uploadProgress = 0f, status = "Загрузка: ${attachment.name}")
                     val path = (resolver.openInputStream(attachment.uri) ?: error("Не удалось открыть файл")).use { stream ->
-                        currentClient.upload(attachment.name, size, stream) { sent, total ->
+                        currentClient.upload(thread.id, options.model, attachment.name, attachment.mimeType, size, stream) { sent, total ->
                             _state.value = _state.value.copy(uploadProgress = sent.toFloat() / total.toFloat())
                         }
                     }
-                    if (resolver.getType(attachment.uri)?.startsWith("image/") == true || attachment.name == "Фото с камеры") {
-                        images.add(path)
+                    if (attachment.mimeType?.startsWith("image/") == true || resolver.getType(attachment.uri)?.startsWith("image/") == true || attachment.name == "Фото с камеры") {
+                        images.add(attachment.name to path)
                     } else {
-                        documents.add(path)
+                        documents.add(attachment.name to path)
                     }
                 }
-                _state.value = _state.value.copy(uploadProgress = null, attachments = emptyList(), status = "Модель отвечает…")
+                stage = "отправка сообщения"
+                _state.value = _state.value.copy(
+                    uploadProgress = null,
+                    attachments = emptyList(),
+                    messages = _state.value.messages + user + ChatMessage(assistantId, "assistant", ""),
+                    status = "Модель отвечает…",
+                )
+                turnStarted = true
                 currentClient.startTurn(thread.id, text, images, documents, options.model, options.effort, options.access) { delta ->
                     _state.value = _state.value.copy(
                         messages = _state.value.messages.map { message ->
@@ -504,7 +548,8 @@ class CodexViewModel(private val context: Context) : ViewModel() {
                     client = null
                     _state.value = _state.value.copy(connected = false)
                 }
-                _state.value = _state.value.copy(sending = false, uploadProgress = null, status = "Ошибка ответа: ${error.message}. Проверьте историю перед повтором.")
+                val advice = if (turnStarted) "Проверьте историю перед повтором." else "Сообщение ещё не отправлено."
+                _state.value = _state.value.copy(sending = false, uploadProgress = null, status = "Ошибка: $stage: ${error.message}. $advice")
             }
         }
     }
@@ -543,7 +588,7 @@ private fun CodexApp() {
     var cameraUri by remember { mutableStateOf<Uri?>(null) }
     val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
         val uri = cameraUri
-        if (success && uri != null) viewModel.addAttachment(PendingAttachment(uri, "Фото с камеры"))
+        if (success && uri != null) viewModel.addAttachment(PendingAttachment(uri, "camera.jpg", "image/jpeg"))
         cameraUri = null
     }
     val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -556,7 +601,23 @@ private fun CodexApp() {
         }
     }
     val pickFile = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        uri?.let { viewModel.addAttachment(PendingAttachment(it, it.lastPathSegment ?: "Файл")) }
+        uri?.let {
+            val resolver = context.contentResolver
+            val displayName = try {
+                resolver.query(it, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getString(0) else null
+                }
+            } catch (_: Exception) {
+                null
+            }
+            viewModel.addAttachment(
+                PendingAttachment(
+                    it,
+                    displayName?.takeIf(String::isNotBlank) ?: "attachment",
+                    resolver.getType(it),
+                ),
+            )
+        }
     }
 
     MaterialTheme {
@@ -692,7 +753,7 @@ private fun ChatScreen(
         topBar = {
             TopAppBar(
                 title = { Text(thread.title, maxLines = 1) },
-                navigationIcon = { IconButton(onClick = onBack) { Text("‹") } },
+                navigationIcon = { IconButton(onClick = onBack, enabled = !sending) { Text("‹") } },
             )
         },
         bottomBar = {
