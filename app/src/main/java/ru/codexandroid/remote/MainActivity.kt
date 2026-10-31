@@ -8,6 +8,7 @@ import android.util.Base64
 import androidx.core.content.FileProvider
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -16,6 +17,34 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.border
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.clickable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.withStyle
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -32,6 +61,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -51,6 +82,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -67,6 +99,7 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.io.File
 import java.util.UUID
+import kotlin.math.roundToInt
 
 data class CodexThread(val id: String, val title: String, val preview: String)
 data class ChatMessage(val id: String, val role: String, val text: String)
@@ -97,6 +130,8 @@ data class AppState(
     val access: AccessOption = AccessOption.INHERIT,
     val modelWarning: String? = null,
     val uploadProgress: Float? = null,
+    val draft: String = "",
+    val autoConnect: Boolean = false,
 )
 
 class BridgeClient(host: String, port: Int, token: String) : Closeable {
@@ -108,20 +143,27 @@ class BridgeClient(host: String, port: Int, token: String) : Closeable {
     val isOpen: Boolean get() = !socket.isClosed
 
     init {
-        socket.connect(InetSocketAddress(host, port), 15_000)
-        reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
-        writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
-        writer.write("codex-bridge $token\n")
-        writer.flush()
-        val hello = JSONObject(reader.readLine() ?: error("Bridge closed during authentication"))
-        check(hello.optBoolean("ok")) { hello.optString("error", "Authentication failed") }
-        request(
-            "initialize",
-            JSONObject().put(
-                "clientInfo",
-                JSONObject().put("name", "codex-android").put("version", "0.2.0"),
-            ),
-        )
+        try {
+            socket.connect(InetSocketAddress(host, port), 15_000)
+            socket.soTimeout = 15_000
+            reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
+            writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
+            writer.write("codex-bridge $token\n")
+            writer.flush()
+            val hello = JSONObject(reader.readLine() ?: throw IOException("Bridge closed during authentication"))
+            check(hello.optBoolean("ok")) { hello.optString("error", "Authentication failed") }
+            request(
+                "initialize",
+                JSONObject().put(
+                    "clientInfo",
+                    JSONObject().put("name", "codex-android").put("version", "0.2.0"),
+                ),
+            )
+            socket.soTimeout = 0
+        } catch (error: Exception) {
+            socket.close()
+            throw error
+        }
     }
 
     private fun request(method: String, params: JSONObject): Response {
@@ -151,6 +193,16 @@ class BridgeClient(host: String, port: Int, token: String) : Closeable {
             JSONObject().put("archived", false).put("limit", 100).put("useStateDbOnly", true),
         ).result.optJSONArray("data") ?: JSONArray()
         return (0 until data.length()).map { threadFromJson(data.getJSONObject(it)) }
+    }
+
+    fun startThread(cwd: String?): CodexThread {
+        val params = JSONObject().put("ephemeral", false)
+        cwd?.takeIf { it.isNotBlank() }?.let { params.put("cwd", it) }
+        val result = request("thread/start", params).result
+        val thread = result.optJSONObject("thread") ?: result
+        val created = threadFromJson(thread)
+        if (created.id.isNotBlank()) resumedThreads.add(created.id)
+        return created
     }
 
     fun listModels(): List<ModelOption> {
@@ -247,6 +299,7 @@ class BridgeClient(host: String, port: Int, token: String) : Closeable {
         model: String?,
         effort: String?,
         access: AccessOption,
+        onAccepted: () -> Unit,
         onDelta: (String) -> Unit,
     ): String {
         val input = JSONArray()
@@ -265,6 +318,7 @@ class BridgeClient(host: String, port: Int, token: String) : Closeable {
             params,
         )
         val turnId = response.result.optJSONObject("turn")?.optString("id").orEmpty()
+        onAccepted()
         response.notifications.forEach { event ->
             if (event.has("id") && event.has("method")) {
                 close()
@@ -346,7 +400,15 @@ private fun extractTurnMessages(turns: JSONArray): List<ChatMessage> {
             when (item.optString("type")) {
                 "userMessage" -> {
                     val content = item.optJSONArray("content") ?: continue
-                    val text = (0 until content.length()).joinToString("") { content.optJSONObject(it)?.optString("text").orEmpty() }
+                    val text = (0 until content.length()).mapNotNull { contentIndex ->
+                        val part = content.optJSONObject(contentIndex) ?: return@mapNotNull null
+                        when (part.optString("type")) {
+                            "text" -> part.optString("text")
+                            "localImage" -> "📎 Изображение: " + part.optString("path").substringAfterLast('\\').substringAfterLast('/')
+                            "image" -> "📎 Изображение"
+                            else -> null
+                        }
+                    }.joinToString("\n")
                     if (text.isNotBlank()) result += ChatMessage(UUID.randomUUID().toString(), "user", text)
                 }
                 "agentMessage" -> {
@@ -366,12 +428,26 @@ class CodexViewModel(private val context: Context) : ViewModel() {
             host = preferences.getString("host", "100.114.88.98").orEmpty(),
             port = preferences.getString("port", "8765").orEmpty(),
             token = preferences.getString("token", "").orEmpty(),
+            model = preferences.getString("selectedModel", null),
+            effort = preferences.getString("selectedEffort", null),
+            autoConnect = preferences.getBoolean("autoConnect", false),
             threads = loadCachedThreads(),
             status = "Нет подключения. Показаны сохранённые сессии.",
         ),
     )
     val state: StateFlow<AppState> = _state.asStateFlow()
     private var client: BridgeClient? = null
+
+    init {
+        if (_state.value.autoConnect && _state.value.host.isNotBlank() && _state.value.token.isNotBlank()) {
+            connect()
+        }
+    }
+
+    fun setAutoConnect(enabled: Boolean) {
+        preferences.edit().putBoolean("autoConnect", enabled).apply()
+        _state.value = _state.value.copy(autoConnect = enabled)
+    }
 
     private fun loadCachedThreads(): List<CodexThread> = try {
         val data = JSONArray(preferences.getString("threads", "[]"))
@@ -403,11 +479,64 @@ class CodexViewModel(private val context: Context) : ViewModel() {
         preferences.edit().putString("host", host).putString("port", port).putString("token", token).apply()
     }
 
-    fun connect() {
-        val current = _state.value
+    fun createNewThread(workspace: String) {
+        if (!_state.value.connected || _state.value.loading || _state.value.sending) return
+        _state.value = _state.value.copy(loading = true, status = "Создание нового диалога…")
         viewModelScope.launch(Dispatchers.IO) {
-            _state.value = current.copy(loading = true, status = "Подключение…")
             try {
+                val created = (client ?: error("Нет подключения к bridge")).startThread(workspace.trim().ifBlank { null })
+                require(created.id.isNotBlank()) { "App Server не вернул идентификатор диалога" }
+                preferences.edit().putString("workspace", workspace.trim()).apply()
+                val updatedThreads = listOf(created) + _state.value.threads.filterNot { it.id == created.id }
+                saveThreads(updatedThreads)
+                _state.value = _state.value.copy(
+                    connected = true,
+                    loading = false,
+                    threads = updatedThreads,
+                    selected = created,
+                    messages = emptyList(),
+                    draft = "",
+                    status = "Новый диалог создан",
+                )
+            } catch (error: Exception) {
+                if (error is IOException || client?.isOpen == false) {
+                    client?.close()
+                    client = null
+                    _state.value = _state.value.copy(connected = false)
+                }
+                _state.value = _state.value.copy(
+                    loading = false,
+                    status = "Не удалось подтвердить создание диалога: ${error.message}. Проверьте историю перед повтором.",
+                )
+            }
+        }
+    }
+
+    fun lastWorkspace(): String = preferences.getString("workspace", "").orEmpty()
+
+    fun draftFor(threadId: String): String =
+        preferences.getString("draft:$threadId", "").orEmpty()
+
+    fun saveDraft(threadId: String, draft: String) {
+        preferences.edit().putString("draft:$threadId", draft).apply()
+        if (_state.value.selected?.id == threadId) _state.value = _state.value.copy(draft = draft)
+    }
+
+    private fun saveChatOptions(model: String?, effort: String?) {
+        preferences.edit()
+            .putString("selectedModel", model)
+            .putString("selectedEffort", effort)
+            .apply()
+    }
+
+    fun connect() {
+        if (_state.value.loading || _state.value.sending) return
+        val current = _state.value
+        _state.value = current.copy(loading = true, connected = false, status = "Подключение…")
+        viewModelScope.launch(Dispatchers.IO) {
+            var lastError: Exception? = null
+            for (attempt in 1..3) {
+              try {
                 client?.close()
                 client = BridgeClient(current.host.trim(), current.port.toInt(), current.token.trim())
                 val threads = client!!.listThreads()
@@ -421,11 +550,17 @@ class CodexViewModel(private val context: Context) : ViewModel() {
                     emptyList()
                 }
                 _state.value = _state.value.copy(connected = true, loading = false, threads = threads, models = models, modelWarning = warning, status = "Подключено")
-            } catch (error: Exception) {
+                return@launch
+              } catch (error: Exception) {
+                lastError = error
                 client?.close()
                 client = null
-                _state.value = _state.value.copy(connected = false, loading = false, status = "Ошибка: ${error.message}")
+                // Invalid credentials/configuration are not transient network errors.
+                if (error !is IOException || attempt == 3) break
+                delay(500L * attempt)
+              }
             }
+            _state.value = _state.value.copy(connected = false, loading = false, status = "Не удалось подключиться: ${lastError?.message}")
         }
     }
 
@@ -435,6 +570,7 @@ class CodexViewModel(private val context: Context) : ViewModel() {
         if (!_state.value.connected) {
             _state.value = _state.value.copy(
                 selected = thread,
+                draft = draftFor(thread.id),
                 messages = loadMessages(thread.id),
                 status = "Нет подключения. Показана сохранённая история.",
                 loading = false,
@@ -445,7 +581,7 @@ class CodexViewModel(private val context: Context) : ViewModel() {
             try {
                 val messages = (client ?: error("Нет подключения к bridge")).readThread(thread.id)
                 saveMessages(thread.id, messages)
-                _state.value = _state.value.copy(selected = thread, messages = messages, loading = false, status = "Открыта сессия")
+                _state.value = _state.value.copy(selected = thread, draft = draftFor(thread.id), messages = messages, loading = false, status = "Открыта сессия")
             } catch (error: Exception) {
                 if (error is IOException) {
                     client?.close()
@@ -454,6 +590,7 @@ class CodexViewModel(private val context: Context) : ViewModel() {
                 }
                 _state.value = _state.value.copy(
                     selected = thread,
+                    draft = draftFor(thread.id),
                     messages = loadMessages(thread.id),
                     loading = false,
                     status = "Не удалось обновить историю: ${error.message}. Показан кэш.",
@@ -477,10 +614,12 @@ class CodexViewModel(private val context: Context) : ViewModel() {
 
     fun selectModel(model: String?) {
         _state.value = _state.value.copy(model = model, effort = null)
+        saveChatOptions(model, null)
     }
 
     fun selectEffort(effort: String?) {
         _state.value = _state.value.copy(effort = effort)
+        saveChatOptions(_state.value.model, effort)
     }
 
     fun selectAccess(access: AccessOption) {
@@ -492,7 +631,9 @@ class CodexViewModel(private val context: Context) : ViewModel() {
         if ((text.isBlank() && _state.value.attachments.isEmpty()) || _state.value.sending || _state.value.loading || !_state.value.connected) return
         _state.value = _state.value.copy(sending = true)
         viewModelScope.launch(Dispatchers.IO) {
-            val user = ChatMessage(UUID.randomUUID().toString(), "user", text)
+            val attachmentLabel = _state.value.attachments.joinToString("\n") { "📎 ${it.name}" }
+            val displayText = listOf(attachmentLabel, text).filter { it.isNotBlank() }.joinToString("\n")
+            val user = ChatMessage(UUID.randomUUID().toString(), "user", "$displayText\n⏳ Отправка")
             val assistantId = UUID.randomUUID().toString()
             var stage = "открытие сессии"
             var turnStarted = false
@@ -533,7 +674,21 @@ class CodexViewModel(private val context: Context) : ViewModel() {
                     status = "Модель отвечает…",
                 )
                 turnStarted = true
-                currentClient.startTurn(thread.id, text, images, documents, options.model, options.effort, options.access) { delta ->
+                currentClient.startTurn(thread.id, text, images, documents, options.model, options.effort, options.access,
+                    onAccepted = {
+                        // Do not erase a newer draft typed while this turn was starting.
+                        if (draftFor(thread.id) == text) saveDraft(thread.id, "")
+                        _state.value = _state.value.copy(messages = _state.value.messages.map {
+                            if (it.id == user.id) {
+                                it.copy(text = if (attachmentLabel.isNotBlank()) {
+                                    "$displayText\n✓ Вложение передано, запрос принят Codex"
+                                } else {
+                                    displayText
+                                })
+                            } else it
+                        })
+                        saveMessages(thread.id, _state.value.messages)
+                    }) { delta ->
                     _state.value = _state.value.copy(
                         messages = _state.value.messages.map { message ->
                             if (message.id == assistantId) message.copy(text = message.text + delta) else message
@@ -543,13 +698,28 @@ class CodexViewModel(private val context: Context) : ViewModel() {
                 saveMessages(thread.id, _state.value.messages)
                 _state.value = _state.value.copy(sending = false, status = "Готово")
             } catch (error: Exception) {
-                if (error is IOException || error.message?.contains("соединение закрыто", ignoreCase = true) == true) {
+                val connectionError = error is IOException ||
+                    error.message?.contains("соединение закрыто", ignoreCase = true) == true ||
+                    error.message?.contains("connection reset", ignoreCase = true) == true
+                if (connectionError) {
                     client?.close()
                     client = null
                     _state.value = _state.value.copy(connected = false)
                 }
                 val advice = if (turnStarted) "Проверьте историю перед повтором." else "Сообщение ещё не отправлено."
-                _state.value = _state.value.copy(sending = false, uploadProgress = null, status = "Ошибка: $stage: ${error.message}. $advice")
+                _state.value = _state.value.copy(
+                    sending = false,
+                    uploadProgress = null,
+                    messages = _state.value.messages.map {
+                        if (it.id == user.id && it.text.endsWith("⏳ Отправка")) it.copy(text = "$displayText\n⚠ Статус отправки неизвестен") else it
+                    },
+                    status = "Ошибка: $stage: ${error.message}. $advice",
+                )
+                if (connectionError) {
+                    _state.value = _state.value.copy(status = "Связь оборвалась. Переподключение…")
+                    delay(500)
+                    connect()
+                }
             }
         }
     }
@@ -584,7 +754,10 @@ private fun CodexApp() {
     var host by remember(state.host) { mutableStateOf(state.host) }
     var port by remember(state.port) { mutableStateOf(state.port) }
     var token by remember(state.token) { mutableStateOf(state.token) }
-    var draft by remember { mutableStateOf("") }
+    var showHome by remember { mutableStateOf(true) }
+    LaunchedEffect(state.selected?.id) {
+        if (state.selected != null) showHome = false
+    }
     var cameraUri by remember { mutableStateOf<Uri?>(null) }
     val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
         val uri = cameraUri
@@ -620,9 +793,27 @@ private fun CodexApp() {
         }
     }
 
-    MaterialTheme {
-        Surface(Modifier.fillMaxSize()) {
-            if (state.selected == null) {
+    val colors = if (isSystemInDarkTheme()) darkColorScheme(
+        primary = Color.White, onPrimary = Color.Black,
+        surface = Color(0xFF212121), background = Color(0xFF212121),
+        surfaceVariant = Color(0xFF303030), onSurfaceVariant = Color(0xFFB4B4B4),
+    ) else lightColorScheme(
+        primary = Color(0xFF171717), onPrimary = Color.White,
+        surface = Color.White, background = Color.White,
+        surfaceVariant = Color(0xFFF4F4F4), onSurfaceVariant = Color(0xFF686868),
+    )
+    MaterialTheme(colorScheme = colors) {
+        BackHandler(enabled = !showHome && state.selected != null) {
+            showHome = true
+        }
+        Surface(
+            Modifier.fillMaxSize().border(
+                1.dp,
+                MaterialTheme.colorScheme.outlineVariant,
+                RoundedCornerShape(12.dp),
+            ),
+        ) {
+            if (state.selected == null || showHome) {
                 ConnectionScreen(
                     state = state,
                     host = host,
@@ -631,20 +822,27 @@ private fun CodexApp() {
                     onHost = { host = it },
                     onPort = { port = it },
                     onToken = { token = it },
+                    onAutoConnect = viewModel::setAutoConnect,
                     onConnect = {
                         viewModel.updateSettings(host, port, token)
                         viewModel.connect()
                     },
-                    onOpen = { thread -> viewModel.openThread(thread) },
+                    workspace = viewModel.lastWorkspace(),
+                    onNewThread = viewModel::createNewThread,
+                    onOpen = { thread ->
+                        if (state.selected?.id == thread.id) showHome = false
+                        else viewModel.openThread(thread)
+                    },
                 )
             } else {
                 ChatScreen(
                     thread = state.selected!!,
                     messages = state.messages,
-                    draft = draft,
+                    draft = state.draft,
                     sending = state.sending,
                     uploadProgress = state.uploadProgress,
                     connected = state.connected,
+                    loading = state.loading,
                     status = state.status,
                     models = state.models,
                     model = state.model,
@@ -658,9 +856,10 @@ private fun CodexApp() {
                     onPickFile = { pickFile.launch("*/*") },
                     onCamera = { cameraPermission.launch(android.Manifest.permission.CAMERA) },
                     onRemoveAttachment = viewModel::removeAttachment,
-                    onDraftChange = { draft = it },
-                    onBack = viewModel::closeThread,
-                    onSend = { viewModel.send(draft); draft = "" },
+                    onDraftChange = { viewModel.saveDraft(state.selected!!.id, it) },
+                    onBack = { showHome = true },
+                    onReconnect = viewModel::connect,
+                    onSend = { viewModel.send(state.draft) },
                 )
             }
         }
@@ -668,6 +867,7 @@ private fun CodexApp() {
 }
 
 @Composable
+@OptIn(ExperimentalMaterial3Api::class)
 private fun ConnectionScreen(
     state: AppState,
     host: String,
@@ -676,35 +876,135 @@ private fun ConnectionScreen(
     onHost: (String) -> Unit,
     onPort: (String) -> Unit,
     onToken: (String) -> Unit,
+    onAutoConnect: (Boolean) -> Unit,
     onConnect: () -> Unit,
+    workspace: String,
+    onNewThread: (String) -> Unit,
     onOpen: (CodexThread) -> Unit,
 ) {
-    Scaffold { padding ->
-        Column(Modifier.fillMaxSize().padding(padding).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("Codex Android Remote", style = MaterialTheme.typography.headlineSmall)
-            Text(state.status, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            OutlinedTextField(host, onHost, label = { Text("Tailscale IP ПК") }, modifier = Modifier.fillMaxWidth())
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(port, onPort, label = { Text("Порт") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(1f))
-                OutlinedTextField(token, onToken, label = { Text("Bridge token") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.weight(2f))
+    var search by remember { mutableStateOf("") }
+    var settings by remember { mutableStateOf(false) }
+    var showNewThread by remember { mutableStateOf(false) }
+    var newWorkspace by remember { mutableStateOf(workspace) }
+    if (showNewThread) {
+        AlertDialog(
+            onDismissRequest = { showNewThread = false },
+            title = { Text("Новый диалог") },
+            text = {
+                Column {
+                    Text("Рабочая папка на ПК. Если оставить пустой, используется папка App Server.")
+                    OutlinedTextField(
+                        value = newWorkspace,
+                        onValueChange = { newWorkspace = it },
+                        label = { Text("Рабочая папка на ПК") },
+                        placeholder = { Text("D:\\Pyfiles\\Codex_android") },
+                        singleLine = true,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showNewThread = false; onNewThread(newWorkspace) }) { Text("Создать") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showNewThread = false }) { Text("Отмена") }
+            },
+        )
+    }
+    BackHandler(settings) { settings = false }
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Codex", style = MaterialTheme.typography.titleLarge) },
+                actions = { TextButton(onClick = { settings = !settings }) { Text("Настройки") } },
+            )
+        },
+    ) { padding ->
+        LazyColumn(
+            Modifier.fillMaxSize().padding(padding).padding(horizontal = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            item {
+                Text("Ваши диалоги", style = MaterialTheme.typography.headlineMedium)
+                Spacer(Modifier.height(8.dp))
+                Text(state.status, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
             }
-            Button(onClick = onConnect, enabled = !state.loading, modifier = Modifier.fillMaxWidth()) {
-                if (state.loading) CircularProgressIndicator() else Text("Подключиться и загрузить сессии")
+            item {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Автоподключение", style = MaterialTheme.typography.bodyMedium)
+                        Text("При открытии приложения", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Switch(checked = state.autoConnect, onCheckedChange = onAutoConnect)
+                }
             }
-            if (state.connected || state.threads.isNotEmpty()) {
-                Text("История Codex", style = MaterialTheme.typography.titleLarge)
-                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(state.threads, key = { it.id }) { thread ->
-                        Card(Modifier.fillMaxWidth()) {
-                            Column(Modifier.padding(14.dp)) {
-                                Text(thread.title, style = MaterialTheme.typography.titleMedium)
-                                Text(thread.preview, maxLines = 2, style = MaterialTheme.typography.bodySmall)
-                                TextButton(onClick = { onOpen(thread) }) { Text("Открыть") }
+            if (settings || !state.connected) {
+                item {
+                    Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(24.dp)) {
+                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Text("Подключение к компьютеру", style = MaterialTheme.typography.titleMedium)
+                            OutlinedTextField(host, onHost, label = { Text("Tailscale IP ПК") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                            OutlinedTextField(port, onPort, label = { Text("Порт") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth())
+                            OutlinedTextField(token, onToken, label = { Text("Bridge token") }, singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+                            Button(onClick = onConnect, enabled = !state.loading && !state.sending, modifier = Modifier.fillMaxWidth()) {
+                                if (state.loading) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                                else Text("Подключиться")
                             }
                         }
                     }
                 }
             }
+            item {
+                TextField(
+                    search, { search = it },
+                    placeholder = { Text("Поиск по истории") },
+                    singleLine = true,
+                    shape = RoundedCornerShape(28.dp),
+                    colors = TextFieldDefaults.colors(
+                        focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                        unfocusedContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                        focusedIndicatorColor = Color.Transparent,
+                        unfocusedIndicatorColor = Color.Transparent,
+                    ),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            item {
+                Button(
+                    onClick = { showNewThread = true },
+                    enabled = state.connected && !state.loading && !state.sending,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(22.dp),
+                ) {
+                    Text("+  Новый диалог")
+                }
+            }
+            if (state.connected && !settings) {
+                item { TextButton(onClick = onConnect, enabled = !state.loading && !state.sending) { Text("Обновить историю") } }
+            }
+            val visible = state.threads.filter { it.title.contains(search, true) || it.preview.contains(search, true) }
+            if (visible.isEmpty()) {
+                item {
+                    Column(Modifier.fillMaxWidth().padding(vertical = 48.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("С чего начнём?", style = MaterialTheme.typography.headlineSmall)
+                        Spacer(Modifier.height(12.dp))
+                        Text("Подключитесь к ПК, чтобы открыть диалоги Codex.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            } else {
+                item { Text("История", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                items(visible, key = { it.id }) { thread ->
+                    Column(
+                        Modifier.fillMaxWidth()
+                            .clickable(enabled = !state.loading && (!state.sending || state.selected?.id == thread.id)) { onOpen(thread) }
+                            .padding(vertical = 14.dp),
+                        verticalArrangement = Arrangement.spacedBy(5.dp),
+                    ) {
+                        Text(thread.title, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
+                        Text(thread.preview, maxLines = 1, overflow = TextOverflow.Ellipsis, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+            item { Spacer(Modifier.height(24.dp)) }
         }
     }
 }
@@ -718,6 +1018,7 @@ private fun ChatScreen(
     sending: Boolean,
     uploadProgress: Float?,
     connected: Boolean,
+    loading: Boolean,
     status: String,
     models: List<ModelOption>,
     model: String?,
@@ -733,10 +1034,14 @@ private fun ChatScreen(
     onRemoveAttachment: (PendingAttachment) -> Unit,
     onDraftChange: (String) -> Unit,
     onBack: () -> Unit,
+    onReconnect: () -> Unit,
     onSend: () -> Unit,
 ) {
     val listState = rememberLazyListState()
+    var showOptions by remember { mutableStateOf(false) }
+    var attachMenu by remember { mutableStateOf(false) }
     var confirmFullAccess by remember { mutableStateOf(false) }
+    BackHandler(showOptions || attachMenu) { showOptions = false; attachMenu = false }
     if (confirmFullAccess) {
         AlertDialog(
             onDismissRequest = { confirmFullAccess = false },
@@ -752,13 +1057,26 @@ private fun ChatScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(thread.title, maxLines = 1) },
-                navigationIcon = { IconButton(onClick = onBack, enabled = !sending) { Text("‹") } },
+                title = {
+                    Column {
+                        Text("Codex", style = MaterialTheme.typography.titleLarge)
+                        Text(thread.title, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                },
+                navigationIcon = { IconButton(onClick = onBack) { Text("‹", style = MaterialTheme.typography.headlineMedium) } },
+                actions = {
+                    TextButton(onClick = { showOptions = !showOptions }) { Text("•••") }
+                },
             )
         },
         bottomBar = {
-            Column(Modifier.padding(12.dp)) {
-                Text(status, style = MaterialTheme.typography.bodySmall)
+            Column(Modifier.imePadding().navigationBarsPadding().padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(status, style = MaterialTheme.typography.labelSmall, maxLines = 2, overflow = TextOverflow.Ellipsis, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
+                    TextButton(onClick = onReconnect, enabled = !sending && !loading) {
+                        Text(if (loading) "Подключение…" else "Переподключить", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
                 uploadProgress?.let {
                     androidx.compose.material3.LinearProgressIndicator(
                         progress = { it },
@@ -766,65 +1084,116 @@ private fun ChatScreen(
                     )
                     Text("Загрузка: ${(it * 100).toInt()}%", style = MaterialTheme.typography.bodySmall)
                 }
+                if (showOptions) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth().border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(18.dp)),
+                    color = if (isSystemInDarkTheme()) Color(0xFF303030) else Color(0xFFE9E9E9),
+                    shape = RoundedCornerShape(18.dp),
+                ) {
+                Column(Modifier.padding(horizontal = 12.dp, vertical = 4.dp)) {
+                Text("Параметры ответа", style = MaterialTheme.typography.titleSmall)
                 modelWarning?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
-                Row {
                     ChoiceMenu(
-                        label = "Модель: ${models.firstOrNull { it.id == model }?.name ?: "сессия"}",
-                        options = listOf("Как в сессии" to null) + models.map { it.name to it.id },
+                        label = "Модель: ${models.firstOrNull { it.id == model }?.name ?: model ?: "как в сессии"}",
+                        options = listOf("Использовать модель сессии" to null) + models.map { it.name to it.id },
                         enabled = !sending,
                         onSelect = onModel,
                     )
                     val efforts = models.firstOrNull { it.id == model }?.efforts.orEmpty()
-                    ChoiceMenu(
-                        label = "Effort: ${effort ?: "сессия"}",
-                        options = listOf("Как в сессии" to null) + efforts.map { it to it },
-                        enabled = !sending && model != null,
-                        onSelect = onEffort,
-                    )
-                }
+                    val effortOptions = listOf<String?>(null) + efforts
+                    val effortIndex = effortOptions.indexOf(effort).coerceAtLeast(0)
+                    Text("Уровень рассуждения: ${effort ?: "как в сессии"}", style = MaterialTheme.typography.bodySmall)
+                    if (effortOptions.size > 1) {
+                        Slider(
+                            value = effortIndex.toFloat(),
+                            onValueChange = { value -> onEffort(effortOptions[value.roundToInt().coerceIn(0, effortOptions.lastIndex)]) },
+                            valueRange = 0f..effortOptions.lastIndex.toFloat(),
+                            steps = (effortOptions.size - 2).coerceAtLeast(0),
+                            enabled = !sending,
+                        )
+                    } else {
+                        Text("Выберите модель, чтобы увидеть доступные уровни", style = MaterialTheme.typography.labelSmall)
+                    }
                 ChoiceMenu(
-                    label = "Доступ: ${access.label}",
+                    label = "Разрешения: ${access.label}",
                     options = AccessOption.entries.map { it.label to it },
                     enabled = !sending,
                     onSelect = { if (it == AccessOption.FULL) confirmFullAccess = true else onAccess(it) },
                 )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TextButton(onClick = onPickFile, enabled = !sending && connected) { Text("Прикрепить файл") }
-                    TextButton(onClick = onCamera, enabled = !sending && connected) { Text("Камера") }
+                }
+                }
                 }
                 attachments.forEach { attachment ->
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("📎 ${attachment.name}", style = MaterialTheme.typography.bodySmall)
-                        TextButton(onClick = { onRemoveAttachment(attachment) }) { Text("Убрать") }
+                    Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(16.dp)) {
+                    Row(Modifier.padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("📎 ${attachment.name}", style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                        TextButton(onClick = { onRemoveAttachment(attachment) }, enabled = !sending) { Text("Убрать") }
+                    }
                     }
                 }
-                if (attachments.isNotEmpty()) {
-                    Text(
-                        "Файлы будут переданы на ПК при отправке сообщения. Максимум — 1 ГиБ на файл.",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(draft, onDraftChange, label = { Text("Сообщение") }, modifier = Modifier.weight(1f))
-                    Button(onClick = onSend, enabled = (draft.isNotBlank() || attachments.isNotEmpty()) && !sending && connected) { Text("Отправить") }
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(28.dp),
+                    modifier = Modifier.fillMaxWidth().border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(28.dp)),
+                ) {
+                    Column(Modifier.fillMaxWidth().padding(8.dp)) {
+                        TextField(
+                            draft, onDraftChange,
+                            placeholder = { Text("Сообщение Codex") },
+                            maxLines = 4,
+                            colors = TextFieldDefaults.colors(
+                                focusedContainerColor = Color.Transparent,
+                                unfocusedContainerColor = Color.Transparent,
+                                focusedIndicatorColor = Color.Transparent,
+                                unfocusedIndicatorColor = Color.Transparent,
+                            ),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Box {
+                                IconButton(onClick = { attachMenu = true }, enabled = !sending && connected) { Text("+", style = MaterialTheme.typography.headlineMedium) }
+                                DropdownMenu(expanded = attachMenu, onDismissRequest = { attachMenu = false }) {
+                                    DropdownMenuItem(text = { Text("Прикрепить файл · до 1 ГиБ") }, onClick = { attachMenu = false; onPickFile() })
+                                    DropdownMenuItem(text = { Text("Сделать фото") }, onClick = { attachMenu = false; onCamera() })
+                                }
+                            }
+                            TextButton(onClick = { showOptions = !showOptions }, modifier = Modifier.weight(1f)) {
+                                Text(models.firstOrNull { it.id == model }?.name ?: model ?: "Модель сессии", maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelMedium)
+                            }
+                            Button(
+                                onClick = onSend,
+                                enabled = (draft.isNotBlank() || attachments.isNotEmpty()) && !sending && !loading && connected,
+                                shape = RoundedCornerShape(24.dp),
+                            ) { Text(if (sending) "…" else "↑", style = MaterialTheme.typography.titleLarge) }
+                        }
+                    }
                 }
             }
         },
     ) { padding ->
         LazyColumn(
             state = listState,
-            modifier = Modifier.fillMaxSize().padding(padding).padding(horizontal = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxSize().padding(padding).padding(horizontal = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(20.dp),
         ) {
             items(messages, key = { it.id }) { message ->
-                Card(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(14.dp)) {
-                        Text(if (message.role == "user") "Вы" else "Codex", style = MaterialTheme.typography.labelLarge)
-                        HorizontalDivider(Modifier.padding(vertical = 6.dp))
-                        Text(message.text.ifBlank { "…" })
+                val isUser = message.role == "user"
+                Column(Modifier.fillMaxWidth(), horizontalAlignment = if (isUser) Alignment.End else Alignment.Start) {
+                    Surface(
+                        color = if (isUser) MaterialTheme.colorScheme.surfaceVariant else Color.Transparent,
+                        shape = RoundedCornerShape(24.dp),
+                        modifier = if (isUser) Modifier.widthIn(max = 320.dp) else Modifier.fillMaxWidth(),
+                    ) {
+                        SelectionContainer {
+                            MarkdownText(
+                                message.text.ifBlank { "…" },
+                                modifier = Modifier.padding(if (isUser) 16.dp else 4.dp),
+                            )
+                        }
                     }
                 }
             }
+            item { Spacer(Modifier.height(12.dp)) }
         }
     }
 }
@@ -839,7 +1208,11 @@ private fun <T> ChoiceMenu(
     var expanded by remember { mutableStateOf(false) }
     androidx.compose.foundation.layout.Box {
         TextButton(onClick = { expanded = true }, enabled = enabled) { Text(label, maxLines = 1) }
-        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            modifier = Modifier.heightIn(max = 240.dp).widthIn(max = 280.dp),
+        ) {
             options.forEach { (title, value) ->
                 DropdownMenuItem(text = { Text(title) }, onClick = { expanded = false; onSelect(value) })
             }

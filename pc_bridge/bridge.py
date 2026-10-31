@@ -213,6 +213,16 @@ class Bridge:
                     await server_writer.drain()
                 server_writer.close()
                 await server_writer.wait_closed()
+            except (ConnectionError, BrokenPipeError, asyncio.IncompleteReadError, OSError) as error:
+                # The Codex child can exit while the phone is still uploading
+                # or sending a request. This is a session failure, not a
+                # bridge crash; avoid an unhandled Task exception.
+                print(
+                    f"bridge client-to-codex disconnected: "
+                    f"{type(error).__name__}: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             finally:
                 for upload in uploads.values():
                     upload["file"].close()
@@ -255,6 +265,12 @@ class Bridge:
                 except ProcessLookupError:
                     pass
             await proc.wait()
+            if proc.returncode not in (0, -15):
+                print(
+                    f"codex app-server exited with code {proc.returncode}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     def handle_stream_upload(self, message: dict, uploads: dict) -> dict:
         request_id = message.get("id")
