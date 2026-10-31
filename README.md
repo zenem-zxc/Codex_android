@@ -10,6 +10,10 @@ Android-клиент для удалённой работы с локальны�
 > **Статус: ранний прототип.** Базовые сценарии Windows bridge проверены
 > локально. Android-приложение ещё не реализовано.
 
+Windows bridge можно собрать в самостоятельный `dist\CodexBridge.exe`.
+После сборки Python для запуска bridge не требуется; установленный Codex
+на ПК по-прежнему необходим.
+
 ## Идея проекта
 
 ```text
@@ -53,7 +57,10 @@ Codex App Server
 Bridge запускает локальный App Server только после подключения клиента:
 
 ```powershell
-python .\pc_bridge\bridge.py --host 127.0.0.1 --port 8765
+powershell -ExecutionPolicy Bypass `
+  -File .\pc_bridge\build_bridge.ps1 -Clean
+
+.\dist\CodexBridge.exe --host 127.0.0.1 --port 8765
 ```
 
 Если bridge запускается через Планировщик заданий и не находит Codex,
@@ -240,7 +247,8 @@ python .\tools\probe_app_server.py
 
 ```text
 pc_bridge/
-  bridge.py                 Windows relay
+  bridge.py                 исходник Windows relay
+  build_bridge.ps1          сборка CodexBridge.exe
   install_autostart.ps1     установка автозапуска
   uninstall_autostart.ps1   удаление автозапуска
   README.md                 инструкции bridge

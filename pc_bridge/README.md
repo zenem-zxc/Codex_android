@@ -1,9 +1,29 @@
 # Windows bridge
 
-## Run manually
+## Build the Windows executable
+
+From the repository root:
 
 ```powershell
-python .\pc_bridge\bridge.py --host 127.0.0.1 --port 8765
+powershell -ExecutionPolicy Bypass `
+  -File .\pc_bridge\build_bridge.ps1 -Clean
+```
+
+Output:
+
+```text
+dist\CodexBridge.exe
+```
+
+Python is only required during the build. The resulting executable contains
+the bridge runtime; Codex itself is still required on the Windows PC.
+
+## Run manually
+
+After building:
+
+```powershell
+.\dist\CodexBridge.exe --host 127.0.0.1 --port 8765
 ```
 
 The bridge starts `codex app-server --stdio` only after an authenticated
