@@ -88,3 +88,11 @@ returned path as a `localImage` input; document input still needs a separate
 protocol integration. Uploads are not automatically cleaned up. Treat them as
 sensitive files; token authentication grants access to the full App Server
 protocol, not just uploads. The TCP transport does not provide TLS.
+
+For larger files clients use `bridge/upload/start` (`fileName`, byte `size`),
+then `bridge/upload/chunk` (`uploadId`, `dataBase64`) with chunks of at most
+256 KiB, followed by `bridge/upload/finish` (`uploadId`). The stream limit is
+1 GiB per file. `bridge/upload/cancel` discards an incomplete upload; the
+bridge also removes incomplete uploads on disconnect. Finished uploads remain
+on disk until manually removed. An image path can be sent as `localImage`;
+other file paths are provided as text and their use depends on Codex access.

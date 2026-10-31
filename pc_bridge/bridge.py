@@ -30,6 +30,8 @@ from pathlib import Path
 MAX_LINE = 16 * 1024 * 1024
 # Base64 expands by 4/3; keep the entire JSON request below MAX_LINE.
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_STREAM_UPLOAD_BYTES = 1024 * 1024 * 1024
+MAX_CHUNK_BYTES = 256 * 1024
 
 
 def resolve_codex(value: str) -> str:
@@ -121,8 +123,17 @@ class Bridge:
         finally:
             if self.active is asyncio.current_task():
                 self.active = None
+            await self.close_writer(writer)
+
+    @staticmethod
+    async def close_writer(writer: asyncio.StreamWriter) -> None:
+        """Close a Windows proactor stream without surfacing peer resets."""
+        try:
             writer.close()
             await writer.wait_closed()
+        except (ConnectionError, asyncio.IncompleteReadError, OSError):
+            # The peer may have disappeared while the socket was closing.
+            pass
 
     async def run_session(
         self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter
@@ -147,27 +158,38 @@ class Bridge:
         assert proc.stdin and proc.stdout and proc.stderr
         server_writer = proc.stdin
 
+        uploads = {}
+
         async def forward_client() -> None:
-            while True:
-                line = await client_reader.readline()
-                if not line:
-                    break
-                if len(line) > MAX_LINE:
-                    raise ValueError("JSON-RPC message is too large")
-                try:
-                    message = json.loads(line)
-                except json.JSONDecodeError:
+            try:
+                while True:
+                    line = await client_reader.readline()
+                    if not line:
+                        break
+                    if len(line) > MAX_LINE:
+                        raise ValueError("JSON-RPC message is too large")
+                    try:
+                        message = json.loads(line)
+                    except json.JSONDecodeError:
+                        server_writer.write(line)
+                        await server_writer.drain()
+                        continue
+                    if isinstance(message, dict) and message.get("method") == "bridge/upload":
+                        response = await self.handle_upload(message)
+                        await write_line(client_writer, json.dumps(response, ensure_ascii=False))
+                        continue
+                    if isinstance(message, dict) and isinstance(message.get("method"), str) and message["method"].startswith("bridge/upload/"):
+                        response = self.handle_stream_upload(message, uploads)
+                        await write_line(client_writer, json.dumps(response, ensure_ascii=False))
+                        continue
                     server_writer.write(line)
                     await server_writer.drain()
-                    continue
-                if isinstance(message, dict) and message.get("method") == "bridge/upload":
-                    response = await self.handle_upload(message)
-                    await write_line(client_writer, json.dumps(response, ensure_ascii=False))
-                    continue
-                server_writer.write(line)
-                await server_writer.drain()
-            server_writer.close()
-            await server_writer.wait_closed()
+                server_writer.close()
+                await server_writer.wait_closed()
+            finally:
+                for upload in uploads.values():
+                    upload["file"].close()
+                    upload["path"].unlink(missing_ok=True)
 
         async def forward_server() -> None:
             await pipe_stream(proc.stdout, client_writer)
@@ -184,9 +206,74 @@ class Bridge:
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         if proc.returncode is None:
             proc.terminate()
         await proc.wait()
+
+    def handle_stream_upload(self, message: dict, uploads: dict) -> dict:
+        request_id = message.get("id")
+        try:
+            if not isinstance(request_id, (str, int)) or isinstance(request_id, bool):
+                raise ValueError("upload requires a request id")
+            params = message.get("params")
+            if not isinstance(params, dict):
+                raise ValueError("params must be an object")
+            method = message["method"]
+            if method == "bridge/upload/start":
+                size = params.get("size")
+                if isinstance(size, bool) or not isinstance(size, int) or not 0 < size <= MAX_STREAM_UPLOAD_BYTES:
+                    raise ValueError("size must be between 1 byte and 1 GiB")
+                name = params.get("fileName")
+                if not isinstance(name, str) or len(name) > 255 or not name or any(ord(c) < 32 for c in name):
+                    raise ValueError("invalid fileName")
+                name = name.replace("\\", "/").rsplit("/", 1)[-1]
+                suffix = Path(name).suffix.lower()
+                if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
+                    suffix = ".bin"
+                if len(uploads) >= 4:
+                    raise ValueError("too many active uploads")
+                self.upload_dir.mkdir(parents=True, exist_ok=True)
+                upload_id = uuid.uuid4().hex
+                path = self.upload_dir / (upload_id + suffix + ".part")
+                uploads[upload_id] = {"file": path.open("xb"), "path": path, "name": name,
+                                      "size": size, "received": 0, "hash": hashlib.sha256(), "suffix": suffix}
+                result = {"uploadId": upload_id, "chunkSize": MAX_CHUNK_BYTES}
+            else:
+                upload_id = params.get("uploadId")
+                if not isinstance(upload_id, str) or upload_id not in uploads:
+                    raise ValueError("unknown uploadId")
+                upload = uploads[upload_id]
+                if method == "bridge/upload/chunk":
+                    encoded = params.get("dataBase64")
+                    if not isinstance(encoded, str) or len(encoded) > ((MAX_CHUNK_BYTES + 2) // 3) * 4:
+                        raise ValueError("invalid chunk")
+                    raw = base64.b64decode(encoded, validate=True)
+                    if not raw or len(raw) > MAX_CHUNK_BYTES or upload["received"] + len(raw) > upload["size"]:
+                        raise ValueError("chunk exceeds declared size")
+                    upload["file"].write(raw)
+                    upload["hash"].update(raw)
+                    upload["received"] += len(raw)
+                    result = {"received": upload["received"]}
+                elif method == "bridge/upload/finish":
+                    if upload["received"] != upload["size"]:
+                        raise ValueError("upload incomplete")
+                    upload["file"].close()
+                    target = self.upload_dir / (upload_id + upload["suffix"])
+                    upload["path"].rename(target)
+                    del uploads[upload_id]
+                    result = {"path": str(target.resolve()), "fileName": upload["name"],
+                              "size": upload["size"], "sha256": upload["hash"].hexdigest()}
+                elif method == "bridge/upload/cancel":
+                    upload["file"].close()
+                    upload["path"].unlink(missing_ok=True)
+                    del uploads[upload_id]
+                    result = {"cancelled": True}
+                else:
+                    raise ValueError("unknown upload method")
+            return {"id": request_id, "result": result}
+        except (ValueError, OSError, binascii.Error) as error:
+            return {"id": request_id, "error": {"code": -32602, "message": str(error)}}
 
     async def handle_upload(self, message: dict) -> dict:
         request_id = message.get("id")

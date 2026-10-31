@@ -3,6 +3,8 @@ package ru.codexandroid.remote
 import android.content.Context
 import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
+import android.util.Base64
 import androidx.core.content.FileProvider
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -94,6 +96,7 @@ data class AppState(
     val effort: String? = null,
     val access: AccessOption = AccessOption.INHERIT,
     val modelWarning: String? = null,
+    val uploadProgress: Float? = null,
 )
 
 class BridgeClient(host: String, port: Int, token: String) : Closeable {
@@ -192,10 +195,39 @@ class BridgeClient(host: String, port: Int, token: String) : Closeable {
         request("thread/resume", JSONObject().put("threadId", id).put("excludeTurns", true))
     }
 
-    fun startTurn(id: String, text: String, model: String?, effort: String?, access: AccessOption, onDelta: (String) -> Unit): String {
+    fun upload(name: String, size: Long, stream: java.io.InputStream, progress: (Long, Long) -> Unit): String {
+        require(size in 1..(1024L * 1024 * 1024)) { "Размер файла должен быть от 1 байта до 1 ГиБ" }
+        val start = request("bridge/upload/start", JSONObject().put("fileName", name).put("size", size)).result
+        val uploadId = start.getString("uploadId")
+        try {
+            val buffer = ByteArray(start.optInt("chunkSize", 262144).coerceIn(1, 262144))
+            var total = 0L
+            while (true) {
+                val count = stream.read(buffer)
+                if (count < 0) break
+                if (count == 0) continue
+                total += count
+                require(total <= size) { "Размер файла изменился" }
+                request("bridge/upload/chunk", JSONObject().put("uploadId", uploadId)
+                    .put("dataBase64", Base64.encodeToString(buffer, 0, count, Base64.NO_WRAP)))
+                progress(total, size)
+            }
+            require(total == size) { "Файл прочитан не полностью" }
+            return request("bridge/upload/finish", JSONObject().put("uploadId", uploadId)).result.getString("path")
+        } catch (error: Exception) {
+            try { request("bridge/upload/cancel", JSONObject().put("uploadId", uploadId)) } catch (_: Exception) {}
+            throw error
+        }
+    }
+
+    fun startTurn(id: String, text: String, images: List<String>, documents: List<String>, model: String?, effort: String?, access: AccessOption, onDelta: (String) -> Unit): String {
+        val input = JSONArray()
+        val message = if (documents.isEmpty()) text else text + "\n\nФайлы на ПК:\n" + documents.joinToString("\n")
+        input.put(JSONObject().put("type", "text").put("text", message))
+        images.forEach { input.put(JSONObject().put("type", "localImage").put("path", it)) }
         val params = JSONObject()
             .put("threadId", id)
-            .put("input", JSONArray().put(JSONObject().put("type", "text").put("text", text)))
+            .put("input", input)
         model?.let { params.put("model", it) }
         effort?.let { params.put("effort", it) }
         access.sandboxType?.let { params.put("sandboxPolicy", JSONObject().put("type", it)) }
@@ -423,7 +455,7 @@ class CodexViewModel(private val context: Context) : ViewModel() {
 
     fun send(text: String) {
         val thread = _state.value.selected ?: return
-        if (text.isBlank() || _state.value.sending || !_state.value.connected || _state.value.attachments.isNotEmpty()) return
+        if ((text.isBlank() && _state.value.attachments.isEmpty()) || _state.value.sending || !_state.value.connected) return
         viewModelScope.launch(Dispatchers.IO) {
             val user = ChatMessage(UUID.randomUUID().toString(), "user", text)
             val assistantId = UUID.randomUUID().toString()
@@ -436,7 +468,28 @@ class CodexViewModel(private val context: Context) : ViewModel() {
                 val currentClient = client ?: error("Нет подключения к bridge")
                 currentClient.resumeThread(thread.id)
                 val options = _state.value
-                currentClient.startTurn(thread.id, text, options.model, options.effort, options.access) { delta ->
+                val images = mutableListOf<String>()
+                val documents = mutableListOf<String>()
+                for (attachment in options.attachments) {
+                    val resolver = context.contentResolver
+                    val size = resolver.query(attachment.uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use {
+                        if (it.moveToFirst() && !it.isNull(0)) it.getLong(0) else -1L
+                    } ?: -1L
+                    require(size > 0) { "Не удалось узнать размер ${attachment.name}" }
+                    _state.value = _state.value.copy(uploadProgress = 0f, status = "Загрузка: ${attachment.name}")
+                    val path = (resolver.openInputStream(attachment.uri) ?: error("Не удалось открыть файл")).use { stream ->
+                        currentClient.upload(attachment.name, size, stream) { sent, total ->
+                            _state.value = _state.value.copy(uploadProgress = sent.toFloat() / total.toFloat())
+                        }
+                    }
+                    if (resolver.getType(attachment.uri)?.startsWith("image/") == true || attachment.name == "Фото с камеры") {
+                        images.add(path)
+                    } else {
+                        documents.add(path)
+                    }
+                }
+                _state.value = _state.value.copy(uploadProgress = null, attachments = emptyList(), status = "Модель отвечает…")
+                currentClient.startTurn(thread.id, text, images, documents, options.model, options.effort, options.access) { delta ->
                     _state.value = _state.value.copy(
                         messages = _state.value.messages.map { message ->
                             if (message.id == assistantId) message.copy(text = message.text + delta) else message
@@ -451,7 +504,7 @@ class CodexViewModel(private val context: Context) : ViewModel() {
                     client = null
                     _state.value = _state.value.copy(connected = false)
                 }
-                _state.value = _state.value.copy(sending = false, status = "Ошибка ответа: ${error.message}. Проверьте историю перед повтором.")
+                _state.value = _state.value.copy(sending = false, uploadProgress = null, status = "Ошибка ответа: ${error.message}. Проверьте историю перед повтором.")
             }
         }
     }
@@ -529,6 +582,7 @@ private fun CodexApp() {
                     messages = state.messages,
                     draft = draft,
                     sending = state.sending,
+                    uploadProgress = state.uploadProgress,
                     connected = state.connected,
                     status = state.status,
                     models = state.models,
@@ -601,6 +655,7 @@ private fun ChatScreen(
     messages: List<ChatMessage>,
     draft: String,
     sending: Boolean,
+    uploadProgress: Float?,
     connected: Boolean,
     status: String,
     models: List<ModelOption>,
@@ -643,6 +698,13 @@ private fun ChatScreen(
         bottomBar = {
             Column(Modifier.padding(12.dp)) {
                 Text(status, style = MaterialTheme.typography.bodySmall)
+                uploadProgress?.let {
+                    androidx.compose.material3.LinearProgressIndicator(
+                        progress = { it },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Text("Загрузка: ${(it * 100).toInt()}%", style = MaterialTheme.typography.bodySmall)
+                }
                 modelWarning?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
                 Row {
                     ChoiceMenu(
@@ -677,13 +739,13 @@ private fun ChatScreen(
                 }
                 if (attachments.isNotEmpty()) {
                     Text(
-                        "Файлы выбраны локально. Передача вложений в Codex будет подключена через отдельный upload-протокол.",
+                        "Файлы будут переданы на ПК при отправке сообщения. Максимум — 1 ГиБ на файл.",
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(draft, onDraftChange, label = { Text("Сообщение") }, modifier = Modifier.weight(1f))
-                    Button(onClick = onSend, enabled = draft.isNotBlank() && !sending && connected && attachments.isEmpty()) { Text("Отправить") }
+                    Button(onClick = onSend, enabled = (draft.isNotBlank() || attachments.isNotEmpty()) && !sending && connected) { Text("Отправить") }
                 }
             }
         },
