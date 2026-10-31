@@ -5,4 +5,12 @@ local.properties
 build/
 captures/
 .research/app-server-schema/
+.venv-build/
 __pycache__/
+.gradle/
+.idea/
+local.properties
+build/
+app/build/
+.venv-build/
+dist/
