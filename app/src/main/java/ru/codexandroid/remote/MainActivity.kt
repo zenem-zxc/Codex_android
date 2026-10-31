@@ -39,6 +39,7 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withStyle
 import androidx.compose.material3.darkColorScheme
@@ -1196,6 +1197,117 @@ private fun ChatScreen(
             item { Spacer(Modifier.height(12.dp)) }
         }
     }
+}
+
+/**
+ * Lightweight Markdown rendering. Unsupported TeX is left visible rather than
+ * silently removed; this is not a full mathematical typesetting engine.
+ */
+private fun renderSimpleMath(source: String): String {
+    var text = source.trim()
+    val fraction = Regex("""\\frac\s*\{([^{}]*)}\s*\{([^{}]*)}""")
+    val squareRoot = Regex("""\\sqrt\s*\{([^{}]*)}""")
+    repeat(8) {
+        val next = text.replace(fraction) { "(${it.groupValues[1]})/(${it.groupValues[2]})" }
+            .replace(squareRoot) { "√(${it.groupValues[1]})" }
+        if (next == text) return@repeat
+        text = next
+    }
+    return text.replace("\\times", "×")
+        .replace("\\cdot", "·")
+        .replace("\\div", "÷")
+        .replace("\\leq", "≤")
+        .replace("\\geq", "≥")
+        .replace("\\neq", "≠")
+}
+
+private fun markdownText(source: String): AnnotatedString = buildAnnotatedString {
+    val text = source.replace("\r\n", "\n")
+    var index = 0
+    var lineStart = true
+    while (index < text.length) {
+        if (lineStart && text.startsWith("```", index)) {
+            val headerEnd = text.indexOf('\n', index)
+            if (headerEnd >= 0) {
+                val end = text.indexOf("```", headerEnd + 1)
+                val bodyEnd = if (end >= 0) end else text.length
+                withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) {
+                    append(text.substring(headerEnd + 1, bodyEnd))
+                }
+                index = if (end >= 0) end + 3 else text.length
+                lineStart = index > 0 && text[index - 1] == '\n'
+                continue
+            }
+        }
+        if (lineStart) {
+            val lineEnd = text.indexOf('\n', index).let { if (it < 0) text.length else it }
+            val line = text.substring(index, lineEnd)
+            val header = Regex("""^(#{1,6})\s+""").find(line)
+            if (header != null) {
+                withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
+                    append(line.substring(header.value.length))
+                }
+                index = lineEnd
+                lineStart = false
+                continue
+            }
+            val bullet = Regex("""^(\s*)[-*]\s+""").find(line)
+            if (bullet != null) {
+                append(bullet.groupValues[1])
+                append("• ")
+                index += bullet.value.length
+                lineStart = false
+                continue
+            }
+        }
+        val math = when {
+            text.startsWith("\\[", index) -> "\\[" to "\\]"
+            text.startsWith("\\(", index) -> "\\(" to "\\)"
+            text.startsWith("$$", index) -> "$$" to "$$"
+            text.startsWith("$", index) -> "$" to "$"
+            else -> null
+        }
+        if (math != null) {
+            val end = text.indexOf(math.second, index + math.first.length)
+            if (end >= 0) {
+                append(renderSimpleMath(text.substring(index + math.first.length, end)))
+                index = end + math.second.length
+                lineStart = false
+                continue
+            }
+        }
+        val delimiter = when {
+            text.startsWith("**", index) -> "**"
+            text.startsWith("__", index) -> "__"
+            text[index] == '`' -> "`"
+            text[index] == '*' -> "*"
+            text[index] == '_' -> "_"
+            else -> null
+        }
+        if (delimiter != null) {
+            val end = text.indexOf(delimiter, index + delimiter.length)
+            if (end > index + delimiter.length && !text.substring(index + delimiter.length, end).contains('\n')) {
+                val style = when (delimiter) {
+                    "**", "__" -> SpanStyle(fontWeight = FontWeight.Bold)
+                    "`" -> SpanStyle(fontFamily = FontFamily.Monospace)
+                    else -> SpanStyle(fontStyle = FontStyle.Italic)
+                }
+                withStyle(style) { append(text.substring(index + delimiter.length, end)) }
+                index = end + delimiter.length
+                lineStart = false
+                continue
+            }
+        }
+        val character = text[index++]
+        append(character)
+        lineStart = character == '\n'
+    }
+}
+
+@Composable
+private fun MarkdownText(source: String, modifier: Modifier = Modifier) {
+    val formatted = remember(source) { markdownText(source) }
+    Text(formatted, modifier = modifier, style = MaterialTheme.typography.bodyLarge)
 }
 
 @Composable
