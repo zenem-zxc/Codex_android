@@ -6,7 +6,7 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $Python = (Get-Command python).Source
-$Codex = (Get-Command codex).Source
+$Codex = (Get-Command codex.exe).Source
 $Script = Join-Path $Root "pc_bridge\bridge.py"
 $TaskName = "Codex Android Bridge"
 $TokenFile = Join-Path $env:USERPROFILE ".codex\bridge.token"

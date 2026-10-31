@@ -18,12 +18,40 @@ import json
 import os
 import secrets
 import signal
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 
 MAX_LINE = 16 * 1024 * 1024
+
+
+def resolve_codex(value: str) -> str:
+    """Resolve codex.exe for interactive shells and Task Scheduler alike."""
+    candidate = Path(value).expanduser()
+    if candidate.is_file():
+        return str(candidate)
+    if candidate.is_absolute() or candidate.parent != Path("."):
+        raise FileNotFoundError(f"Specified Codex executable does not exist: {candidate}")
+
+    found = shutil.which(value) or shutil.which("codex.exe")
+    if found:
+        return found
+
+    user_profile = os.environ.get("USERPROFILE", "")
+    extension_root = Path(user_profile) / ".vscode" / "extensions"
+    matches = sorted(
+        extension_root.glob("openai.chatgpt-*/bin/windows-x86_64/codex.exe"),
+        reverse=True,
+    )
+    if matches:
+        return str(matches[0])
+
+    raise FileNotFoundError(
+        "codex.exe was not found. Start bridge with "
+        '--codex "C:\\path\\to\\codex.exe" or set CODEX_EXE.'
+    )
 
 
 def load_token(path: Path) -> str:
@@ -140,7 +168,9 @@ class Bridge:
 
 async def serve(host: str, port: int, codex: str, token_file: Path) -> None:
     token = load_token(token_file)
-    bridge = Bridge(codex, token)
+    resolved_codex = resolve_codex(codex)
+    print(f"Codex executable: {resolved_codex}", flush=True)
+    bridge = Bridge(resolved_codex, token)
     server = await asyncio.start_server(bridge.handle, host, port, limit=MAX_LINE + 1024)
     addresses = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
     print(f"Codex bridge listening on {addresses}", flush=True)
@@ -151,10 +181,10 @@ async def serve(host: str, port: int, codex: str, token_file: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default=os.environ.get("CODEX_BRIDGE_HOST", "127.0.0.1"))
+    parser.add_argument("--host", default=os.environ.get("CODEX_BRIDGE_HOST", "100.114.88.98"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("CODEX_BRIDGE_PORT", "8765")))
     parser.add_argument("--token-file", type=Path, default=Path.home() / ".codex" / "bridge.token")
-    parser.add_argument("--codex", default=os.environ.get("CODEX_EXE", "codex"))
+    parser.add_argument("--codex", default=os.environ.get("CODEX_EXE", "codex.exe"))
     args = parser.parse_args()
     try:
         asyncio.run(serve(args.host, args.port, args.codex, args.token_file))

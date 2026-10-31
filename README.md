@@ -56,6 +56,20 @@ Bridge запускает локальный App Server только после 
 python .\pc_bridge\bridge.py --host 127.0.0.1 --port 8765
 ```
 
+Если bridge запускается через Планировщик заданий и не находит Codex,
+укажите полный путь:
+
+```powershell
+$Codex = (Get-Command codex.exe).Source
+python .\pc_bridge\bridge.py `
+  --host "<TAILSCALE_IP_WINDOWS>" `
+  --port 8765 `
+  --codex "$Codex"
+```
+
+В обычной установке Codex bridge также автоматически ищет
+`%USERPROFILE%\.vscode\extensions\openai.chatgpt-*\bin\windows-x86_64\codex.exe`.
+
 После подключения bridge передаёт без изменения:
 
 - JSON-RPC-запросы;
