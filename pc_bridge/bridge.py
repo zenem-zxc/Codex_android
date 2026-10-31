@@ -108,6 +108,7 @@ class Bridge:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
+            limit=MAX_LINE + 1024,
         )
         assert proc.stdin and proc.stdout and proc.stderr
         server_writer = proc.stdin

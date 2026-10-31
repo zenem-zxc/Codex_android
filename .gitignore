@@ -5,3 +5,4 @@ local.properties
 build/
 captures/
 .research/app-server-schema/
+__pycache__/
