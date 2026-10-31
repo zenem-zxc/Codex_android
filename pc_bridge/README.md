@@ -5,9 +5,14 @@
 From the repository root:
 
 ```powershell
+python -m venv .venv-build
+.\.venv-build\Scripts\python.exe -m pip install --upgrade pyinstaller
 powershell -ExecutionPolicy Bypass `
   -File .\pc_bridge\build_bridge.ps1 -Clean
 ```
+
+The build script automatically uses `.venv-build` when it exists. PyInstaller
+5.12 or newer is required for the installed Python 3.11 runtime.
 
 Output:
 
@@ -17,6 +22,10 @@ dist\CodexBridge.exe
 
 Python is only required during the build. The resulting executable contains
 the bridge runtime; Codex itself is still required on the Windows PC.
+
+If startup fails with a missing `ipaddress` module, upgrade PyInstaller to
+version 5.12 or newer and rebuild. Older versions can omit a Python 3.11.4+
+bootstrap dependency even when the build completes.
 
 ## Run manually
 

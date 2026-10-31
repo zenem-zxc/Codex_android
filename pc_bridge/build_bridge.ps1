@@ -6,16 +6,22 @@ $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $Root
 
-$PyInstaller = (Get-Command pyinstaller.exe -ErrorAction Stop).Source
+$BuildPython = Join-Path $Root ".venv-build\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $BuildPython)) {
+    $BuildPython = (Get-Command python.exe -ErrorAction Stop).Source
+}
 $EntryPoint = Join-Path $Root "pc_bridge\bridge.py"
 
 if ($Clean) {
-    Remove-Item -LiteralPath (Join-Path $Root "build") -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath (Join-Path $Root "dist") -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath (Join-Path $Root "CodexBridge.spec") -Force -ErrorAction SilentlyContinue
+    Write-Host "Using PyInstaller's own --clean option; existing build and dist files are preserved."
 }
 
-& $PyInstaller `
+& $BuildPython -c "import importlib.metadata as m, sys; v=tuple(map(int, m.version('pyinstaller').split('.')[:2])); print('PyInstaller', m.version('pyinstaller')); sys.exit(0 if v >= (5, 12) else 1)"
+if ($LASTEXITCODE -ne 0) {
+    throw "PyInstaller 5.12 or newer is required. Run: python -m pip install --upgrade pyinstaller"
+}
+
+& $BuildPython -m PyInstaller `
     --noconfirm `
     --clean `
     --onefile `
